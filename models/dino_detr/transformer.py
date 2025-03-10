@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from utils.misc import inverse_sigmoid
 from .layers import MHA, FeedForward, MLP
-
+from typing import Optional
 
 def get_transformer(args):
     """Get a transformer model with the arguments."""
@@ -24,7 +24,10 @@ def get_transformer(args):
                               decoder_ca_position_mode=args.decoder_ca_position_mode,
                               query_scale_mode=args.query_scale_mode,
                               num_pattern=args.num_pattern,
-                              modulate_wh_attn=args.modulate_wh_attn)
+                              modulate_wh_attn=args.modulate_wh_attn,
+                              decoder_temperature=args.temperature,
+                              two_stage_mode=args.two_stage_mode,
+                              num_encoder_query=args.num_encoder_query)
     return transformer
 
 
@@ -45,7 +48,10 @@ class Transformer(nn.Module):
                  decoder_ca_position_mode: str = 'cat',
                  query_scale_mode: str = 'diag',
                  num_pattern: int = 0,
-                 modulate_wh_attn: bool = True):
+                 modulate_wh_attn: bool = True,
+                 decoder_temperature: int = 10000,
+                 two_stage_mode: str = 'static',
+                 num_encoder_query: int = 100):
         """Initiailze."""
         super().__init__()
 
@@ -64,13 +70,21 @@ class Transformer(nn.Module):
                                activation=activation,
                                return_intermediate=return_intermediate,
                                p_drop=p_drop,
+                               temperature=decoder_temperature,
                                sa_position_mode=decoder_sa_position_mode,
                                ca_position_mode=decoder_ca_position_mode,
                                query_scale_mode=query_scale_mode,
                                modulate_wh_attn=modulate_wh_attn)
 
+        self.two_stage_mode = two_stage_mode
+        if self.two_stage_mode in ['pure', 'mix']:
+            self.enc_box_embed = None
+            self.enc_cls_embed = None
+            self.num_encoder_query = num_encoder_query
+            self.enc_out_layer = nn.Linear(d_model, d_model)
+            self.enc_out_norm = nn.LayerNorm(d_model)
+        
         self._reset_parameters()
-
         # Pattern embedding for multiple object detections on a location.
         # Ref: Anchor DETR
         if num_pattern > 0:
@@ -82,7 +96,7 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, f, x, pos_embed, query, mask, attn_mask):
+    def forward(self, img_feature, pos_embed, anchor_query, img_mask, feature_shape, noised_query, label_enc):
         """Forward function.
 
         f: image feuatre (batch size x HW x d_model)
@@ -91,13 +105,171 @@ class Transformer(nn.Module):
         query: anchor query (batch size x num_query x 4)
         mask: key padding mask (batch size x 1 x HW)
         """
-        memory, enc_sa = self.encoder(f, pos_embed, mask)
+        memory = self.encoder(img_feature, pos_embed, img_mask)
+        
+        # two stage
+        enc_output = None
+        reference = None
+        if self.two_stage_mode in ['pure', 'mix']:
+            memory = self.enc_out_norm(self.enc_out_layer(memory))
+            
+            # get referecne with mask and feature map shape
+            reference = self.get_encoder_reference(img_mask, feature_shape)
 
-        h_s, anchors, dec_sa, dec_ca = self.decoder(x, memory, pos_embed, query, mask, attn_mask)
+            # get logits and box coordinates
+            logits = self.enc_cls_embed(memory)
+            boxes = (reference + self.enc_box_embed(memory)).sigmoid()
 
-        return h_s, anchors, enc_sa, dec_sa, dec_ca
+            # get topk(by logit) samples(boxs, labels) from the encoder output
+            enc_output = self.get_topk_query(boxes, logits, img_mask, self.num_encoder_query)
 
+        # make query for decoder (merge multiple queries for efficiency)
+        label_query, anchor_query, dec_sa_mask = self.make_object_query(bs=memory.shape[0],
+                                                                        mode=self.two_stage_mode, 
+                                                                        encoder_output=enc_output,
+                                                                        label_enc=label_enc,
+                                                                        anchor_query=anchor_query,
+                                                                        noised_query=noised_query,
+                                                                        device=memory.device)
+             
+        h_s, anchors = self.decoder(label_query, memory, pos_embed, anchor_query, img_mask, dec_sa_mask)
 
+        return h_s, anchors, reference, memory
+
+    def get_encoder_reference(self, mask, shapes):
+        N, _, H, W = shapes
+        device = mask.device
+        mask = mask.squeeze().view(N, H, W)
+        
+        grid_y, grid_x = torch.meshgrid(torch.linspace(0, H-1, H, dtype=torch.float32), 
+                                        torch.linspace(0, W-1, W, dtype=torch.float32),
+                                        indexing='ij')
+
+        xy = torch.cat([grid_x.unsqueeze(-1), grid_y.unsqueeze(-1)], dim=-1).to(device)
+
+        scale_h = torch.sum(mask[:,  :, 0], dim=1)
+        scale_w = torch.sum(mask[:, 0, :], dim=1)
+        scale = torch.cat([scale_w.unsqueeze(-1), scale_h.unsqueeze(-1)], dim=1)
+        scale = scale.unsqueeze(1).unsqueeze(2)
+
+        xy = (xy.unsqueeze(0) + 0.5) / scale
+
+        # TODO: need to improve current hard coding
+        wh = torch.ones_like(xy) * 0.1
+        # wh = torch.rand_like(xy) * 0.5
+        # wh = torch.randint_like(xy, 1, 5) * 0.1
+
+        enc_ref = inverse_sigmoid(torch.cat([xy, wh], dim=-1))
+        enc_ref = enc_ref.masked_fill(mask.unsqueeze(-1) == 0, float('-inf'))
+        enc_ref = enc_ref.flatten(1, 2)
+
+        return enc_ref
+
+    def get_topk_query(self, boxes, logits, mask, topk=100):
+        """
+        boxes, logits: output of the encoder
+        mask: image padding mask
+        topk: for encoder query
+        """
+        logits.masked_fill_(mask.squeeze().unsqueeze(-1) == 0, float('-inf'))
+        max_logits, max_labels = torch.max(logits, dim=2)
+        topk_indices = torch.topk(max_logits, k=topk, dim=1)[1]
+        
+        boxes = torch.gather(boxes, 1, topk_indices.unsqueeze(-1).repeat(1, 1, 4))
+        labels = torch.gather(max_labels, 1, topk_indices)
+        output = {'boxes': boxes, 'labels': labels}
+        return output
+
+    def make_object_query(self,
+                          bs: int,
+                          mode: str,
+                          encoder_output: Optional[dict],
+                          label_enc: torch.nn.Embedding,
+                          anchor_query: Optional[torch.nn.Embedding],
+                          noised_query: dict,
+                          device: torch.device):
+        """Make decoder input query and attn. mask
+        mode: 'add', 'pure', 'mix'
+            - 'add': add encoder's topk boxes as additional input query to train encoder
+                * query order: cdn query, model query, encoder output
+            - 'pure': use encoder's topk boxes and labels as decoder query
+            - 'mix': mixed query selection, only use box query
+        encoder_output
+        label_enc: torch.nn.Embedding [num_class+1, d_model-1]
+        anchor_query: None or torch.Tensor [num_query, 4]
+        cdn: dict
+        """
+        # make the query
+        if mode in ['none', 'static']:
+            num_class = label_enc.weight.shape[0] - 1
+            num_query = anchor_query.weight.shape[0]
+            label_embedding = label_enc(torch.tensor(num_class, device=device))
+            indicator = torch.tensor([0], device=device)
+            
+            model_label_query = torch.cat([label_embedding, indicator]) # d_model
+            model_label_query = model_label_query[None, None, :].repeat(bs, num_query, 1)
+            model_anchor_query = anchor_query.weight.unsqueeze(0).repeat(bs, 1, 1) # bs, num_query, 4
+            
+        # make query
+        elif mode in ['pure', 'mix']:
+            enc_boxes = encoder_output['boxes']
+            enc_anchor_query = inverse_sigmoid(enc_boxes)
+            
+            if mode == 'pure':
+                enc_labels = encoder_output['labels']
+                N, C = enc_labels.shape # batch size, num query
+                enc_label_embedding = label_enc(enc_labels) # batch size, num query, d_model
+                indicator = torch.tensor([0], device=device)[None, None, :].repeat(N, C, 1)
+                enc_label_query = torch.cat([enc_label_embedding, indicator], dim=-1)
+                
+            elif mode == 'mix':
+                # use learnable label query
+                num_class = label_enc.weight.shape[0] - 1
+                num_query = enc_boxes.shape[1]
+                label_embedding = label_enc(torch.tensor(num_class, device=device))
+                indicator = torch.tensor([0], device=device)
+                enc_label_query = torch.cat([label_embedding, indicator]) # d_model
+                enc_label_query = enc_label_query[None, None, :].repeat(bs, num_query, 1)
+            
+        # merge cdn query and model query
+        if self.training:
+            noised_label_query = noised_query['label_query']
+            noised_anchor_query = noised_query['anchor_query']
+            noised_attn_mask = noised_query['attn_mask']
+            num_noised_query = noised_label_query.shape[1]
+            
+            if mode == 'static':
+                label_query = torch.cat([noised_label_query,
+                                         model_label_query], dim=1)
+                anchor_query = torch.cat([noised_anchor_query,
+                                          model_anchor_query], dim=1)
+                n = label_query.shape[1]
+                attn_mask = torch.zeros((n, n), device=device)
+                attn_mask[:num_noised_query, :num_noised_query] = noised_attn_mask
+                attn_mask[:, num_noised_query:] = 1
+                
+            elif mode in ['pure', 'mix']:
+                label_query = torch.cat([noised_label_query,
+                                         enc_label_query], dim=1)
+                anchor_query = torch.cat([noised_anchor_query,
+                                          enc_anchor_query], dim=1)
+                n = label_query.shape[1]
+                attn_mask = torch.zeros((n, n), device=device)
+                attn_mask[:num_noised_query, :num_noised_query] = noised_attn_mask
+                attn_mask[num_noised_query:, num_noised_query:] = 1
+            
+        else:
+            attn_mask = None
+            if mode in ['none', 'static']:
+                label_query = model_label_query
+                anchor_query = model_anchor_query
+
+            elif mode in ['pure', 'mix']:
+                label_query = enc_label_query
+                anchor_query = enc_anchor_query
+            
+        return label_query, anchor_query, attn_mask
+    
 class Encoder(nn.Module):
     """Encoder."""
 
@@ -124,8 +296,8 @@ class Encoder(nn.Module):
     def forward(self, x, pos_embed, mask=None):
         """Forward function."""
         for layer in self.layers:
-            x, sa = layer(x, pos_embed, mask)
-        return x, sa
+            x = layer(x, pos_embed, mask)
+        return x
 
 
 class EncoderLayer(nn.Module):
@@ -174,7 +346,7 @@ class EncoderLayer(nn.Module):
 
         y = self.ff(x)
         x = self.norm2(x + self.dropout2(y))
-        return x, attention
+        return x
 
 
 class Decoder(nn.Module):
@@ -188,6 +360,7 @@ class Decoder(nn.Module):
                  activation: str = 'relu',
                  return_intermediate: bool = False,
                  p_drop: float = 0.1,
+                 temperature: int = 10000,
                  sa_position_mode: str = 'add',
                  ca_position_mode: str = 'cat',
                  query_scale_mode: str = 'diag',
@@ -197,7 +370,7 @@ class Decoder(nn.Module):
         modulate_wh_attn: edit positional attention weight scale info(w, h)
         """
         super().__init__()
-
+        self.t = temperature
         self.layers = nn.ModuleList([
             DecoderLayer(d_model=d_model,
                          n_heads=n_heads,
@@ -258,7 +431,7 @@ class Decoder(nn.Module):
 
         for index, layer in enumerate(self.layers):
             # generate a pos embed with anchor
-            query_sine_embed = gen_sineembed_for_position(anchor, d_model)
+            query_sine_embed = gen_sineembed_for_position(anchor, self.t, d_model)
 
             # transform to get pos embed in self-attn
             sa_pos_embed = self.ref_point_head(query_sine_embed)
@@ -274,14 +447,14 @@ class Decoder(nn.Module):
                 ca_pos_embed[..., d_model // 2:] *= (wh_ref[..., 0] / anchor[..., 2]).unsqueeze(-1)
                 ca_pos_embed[..., :d_model // 2] *= (wh_ref[..., 1] / anchor[..., 3]).unsqueeze(-1)
 
-            x, sa, ca = layer(x,
-                              memory,
-                              pos_embed,
-                              sa_pos_embed,
-                              ca_pos_embed,
-                              mask,
-                              attn_mask,
-                              is_first=index == 0)
+            x = layer(x,
+                      memory,
+                      pos_embed,
+                      sa_pos_embed,
+                      ca_pos_embed,
+                      mask,
+                      attn_mask,
+                      is_first=index == 0)
 
             # iter update
             if self.box_embed is not None:
@@ -301,7 +474,7 @@ class Decoder(nn.Module):
         if not self.return_intermediate:
             xs.append(x)
 
-        return xs, anchors, sa, ca
+        return xs, anchors
 
 
 class DecoderLayer(nn.Module):
@@ -430,10 +603,10 @@ class DecoderLayer(nn.Module):
         ########################
         y = self.ff(x)
         x = self.norm3(x + self.dropout3(y))
-        return x, self_attention, cross_attention
+        return x
 
 
-def gen_sineembed_for_position(pos_tensor, d_model=256):
+def gen_sineembed_for_position(pos_tensor, temeprature=10000, d_model=256):
     """Generate sine embedding.
 
     - pos tensor has 3-dim(bs, n_query, 4)
@@ -441,7 +614,7 @@ def gen_sineembed_for_position(pos_tensor, d_model=256):
     """
     scale = 2 * math.pi
     dim_t = torch.arange(d_model // 2, dtype=torch.float32, device=pos_tensor.device)
-    dim_t = 10000 ** (2 * (dim_t // 2) / (d_model // 2))
+    dim_t = temeprature ** (2 * (dim_t // 2) / (d_model // 2))
     x_embed = pos_tensor[:, :, 0] * scale
     y_embed = pos_tensor[:, :, 1] * scale
     pos_x = x_embed[:, :, None] / dim_t

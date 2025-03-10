@@ -73,10 +73,8 @@ class DETR(nn.Module):
         nn.init.normal_(self.query.weight.data, mean=0.0, std=0.02)
 
 
-    def forward(self, img, mask):
+    def forward(self, img, mask, target=None):
         """Forward."""
-        bs = img.shape[0]
-
         # feature extraction
         feature = self.backbone(img)
         mask = F.interpolate(mask.unsqueeze(1), feature.shape[2:], mode='nearest')
@@ -87,21 +85,20 @@ class DETR(nn.Module):
 
         mask = mask.flatten(2).unsqueeze(1).bool()
         f = self.input_proj(feature).flatten(2).permute(0, 2, 1)
+        
+        hs = self.transformer(f, pos_embed, self.query.weight, mask)
+        
+        if self.training:
+            outputs = {'model': []}
+            for h in hs:
+                outputs['model'].append({
+                    'pred_logits': self.cls_embed(h),
+                    'pred_boxes': self.box_embed(h).sigmoid()
+                })
+        else:
+            outputs = {
+                'pred_logits': self.cls_embed(hs[-1]),
+                'pred_boxes': self.box_embed(hs[-1]).sigmoid()
+            }
 
-        query = self.query.weight.unsqueeze(0).repeat(bs, 1, 1)
-        hs, enc_sa, dec_sa, dec_ca = self.transformer(f, pos_embed, query, mask)
-
-        outputs = [
-            {
-                'pred_logits': self.cls_embed(h),
-                'pred_boxes': self.box_embed(h).sigmoid()
-            } for h in hs
-        ]
-        # for visualize attention weights
-        attns = {
-            'enc_sa': enc_sa,
-            'dec_sa': dec_sa,
-            'dec_ca': dec_ca
-        }
-
-        return outputs, attns
+        return outputs

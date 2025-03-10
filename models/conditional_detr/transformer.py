@@ -18,6 +18,7 @@ def get_transformer(args):
                               activation=args.activation,
                               p_drop=args.p_drop,
                               encoder_position_mode=args.encoder_position_mode,
+                              decoder_temperature=args.temperature,
                               decoder_sa_position_mode=args.decoder_sa_position_mode,
                               decoder_ca_position_mode=args.decoder_ca_position_mode,
                               query_scale_mode=args.query_scale_mode)
@@ -37,6 +38,7 @@ class Transformer(nn.Module):
                  activation: str = 'relu',
                  p_drop: float = 0.0,
                  encoder_position_mode: str = 'add',
+                 decoder_temperature: int = 10000,
                  decoder_sa_position_mode: str = 'add',
                  decoder_ca_position_mode: str = 'cat',
                  query_scale_mode: str = 'diag'):
@@ -58,6 +60,7 @@ class Transformer(nn.Module):
                                activation=activation,
                                return_intermediate=return_intermediate,
                                p_drop=p_drop,
+                               temperature=decoder_temperature,
                                sa_position_mode=decoder_sa_position_mode,
                                ca_position_mode=decoder_ca_position_mode,
                                query_scale_mode=query_scale_mode)
@@ -71,12 +74,14 @@ class Transformer(nn.Module):
 
     def forward(self, f, pos_embed, query, mask):
         """Forward function."""
-        memory, enc_sa = self.encoder(f, pos_embed, mask)
-
+        memory = self.encoder(f, pos_embed, mask)
+        
+        bs = f.shape[0]
+        query = query.unsqueeze(0).repeat(bs, 1, 1)
         x = torch.zeros_like(query)
-        h_s, ref_points, dec_sa, dec_ca = self.decoder(x, memory, pos_embed, query, mask)
+        h_s, ref_points = self.decoder(x, memory, pos_embed, query, mask)
 
-        return h_s, ref_points, enc_sa, dec_sa, dec_ca
+        return h_s, ref_points
 
 
 class Encoder(nn.Module):
@@ -110,8 +115,8 @@ class Encoder(nn.Module):
     def forward(self, x, pos_embed, mask=None):
         """Forward function."""
         for layer in self.layers:
-            x, sa = layer(x, pos_embed, mask)
-        return x, sa
+            x = layer(x, pos_embed, mask)
+        return x
 
 
 class EncoderLayer(nn.Module):
@@ -160,7 +165,7 @@ class EncoderLayer(nn.Module):
 
         y = self.ff(x)
         x = self.norm2(x + self.dropout2(y))
-        return x, attention
+        return x
 
 
 class Decoder(nn.Module):
@@ -174,6 +179,7 @@ class Decoder(nn.Module):
                  activation: str = 'relu',
                  return_intermediate: bool = False,
                  p_drop: float = 0.1,
+                 temperature: int = 10000,
                  sa_position_mode: str = 'add',
                  ca_position_mode: str = 'cat',
                  query_scale_mode: str = 'diag',
@@ -185,7 +191,7 @@ class Decoder(nn.Module):
             - 1: concatenate feature and pos embedding
         """
         super().__init__()
-
+        self.t = temperature
         self.layers = nn.ModuleList([
             DecoderLayer(d_model=d_model,
                          n_heads=n_heads,
@@ -219,16 +225,16 @@ class Decoder(nn.Module):
         """Forward."""
         xs = []
         ref_points = self.ref_point_head(query).sigmoid()  # batch, num_query, d_model
-
+        d_model = x.shape[-1]
         for index, layer in enumerate(self.layers):
             if index == 0 or self.query_scale == 1:
                 pos_transformation = 1
             else:
                 pos_transformation = self.query_scale(x)
-            query_sine_embed = gen_sineembed_for_position(ref_points)
+            query_sine_embed = gen_sineembed_for_position(ref_points, self.t, d_model)
             query_sine_embed *= pos_transformation
 
-            x, sa, ca = layer(x, memory, pos_embed, query, query_sine_embed, mask, is_first=index == 0)
+            x = layer(x, memory, pos_embed, query, query_sine_embed, mask, is_first=index == 0)
 
             if self.return_intermediate:
                 xs.append(x)
@@ -236,7 +242,7 @@ class Decoder(nn.Module):
         if not self.return_intermediate:
             xs.append(x)
 
-        return xs, ref_points, sa, ca
+        return xs, ref_points
 
 
 class DecoderLayer(nn.Module):
@@ -355,16 +361,16 @@ class DecoderLayer(nn.Module):
         # feed-forward
         y = self.ff(x)
         x = self.norm3(x + self.dropout3(y))
-        return x, self_attention, cross_attention
+        return x
 
 
-def gen_sineembed_for_position(pos_tensor):
+def gen_sineembed_for_position(pos_tensor, temperature=10000, d_model=256):
     """Generate sine embedding."""
     # n_query, bs, 2 = pos_tensor.size()
     # sineembed_tensor = torch.zeros(n_query, bs, 256)
     scale = 2 * math.pi
-    dim_t = torch.arange(128, dtype=torch.float32, device=pos_tensor.device)
-    dim_t = 10000 ** (2 * (dim_t // 2) / 128)
+    dim_t = torch.arange(d_model//2, dtype=torch.float32, device=pos_tensor.device)
+    dim_t = temperature ** (2 * (dim_t // 2) / d_model//2)
     x_embed = pos_tensor[:, :, 0] * scale
     y_embed = pos_tensor[:, :, 1] * scale
     pos_x = x_embed[:, :, None] / dim_t

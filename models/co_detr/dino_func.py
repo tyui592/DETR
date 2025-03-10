@@ -37,21 +37,19 @@ def generate_noised_neg_boxes(existing_boxes,
         attempt += 1
     return torch.tensor(result[:num_boxes])
 
-
 def make_cdn_query(targets: list = None,
+                   bs: int = 4,
                    num_group: int = 5,
                    label_enc: torch.nn.Embedding = None,
                    num_class: int = 2,
                    label_noise_scale: float = 0.2,
                    box_noise_scale: float = 0.4,
-                   num_cdn_query: int = 0,
-                   add_neg_query: bool = False,
+                   num_cdn_query: int = 100,
+                   add_neg_query: bool = True,
                    device = torch.device('cpu')):
     """Make noised positive and negative queies with targets.
     
     """
-    bs = len(targets)
-    
     # label query(embedding) of model(learnable) query
     if num_cdn_query > 0:
         max_obj = num_cdn_query # fix number of noised query
@@ -65,7 +63,8 @@ def make_cdn_query(targets: list = None,
     noised_boxes = torch.rand(bs, num_group, max_obj, 4, device=device)
 
     if add_neg_query:
-        neg_labels = torch.randint(0, num_class, size=(bs, num_group, max_obj), device=device)
+        # neg_labels = torch.randint(0, num_class, size=(bs, num_group, max_obj), device=device)
+        neg_labels = torch.full((bs, num_group, max_obj), num_class, device=device)
         neg_boxes = torch.rand(bs, num_group, max_obj, 4, device=device) # dummy
     
     for i, target in enumerate(targets):
@@ -163,26 +162,22 @@ def make_cdn_query(targets: list = None,
         }
     return cdn
 
-
-def split_outputs(outputs, targets, num_group):
-    max_obj = max([len(t['labels']) for t in targets])
-    num_dn_query = max_obj * num_group    
+def split_outputs(outputs, num_dn_query):
     parts = defaultdict(list)
     for output in outputs:
         pred_logits = output['pred_logits']
         pred_boxes = output['pred_boxes']
         n = pred_logits.shape[1]
-        sizes = [num_dn_query, n - num_dn_query] 
-        noised_logits, model_logits = pred_logits.split(sizes, dim=1)
-        noised_boxes, model_boxes = pred_boxes.split(sizes, dim=1)
-        
-        parts['noised'].append({
-            'pred_logits': noised_logits,
-            'pred_boxes': noised_boxes,
+        sizes = [num_dn_query, n-num_dn_query]
+        cdn_logits, model_logits = pred_logits.split(sizes, dim=1)
+        cdn_boxes, model_boxes = pred_boxes.split(sizes, dim=1)
+        parts['cdn'].append({
+            'pred_logits': cdn_logits,
+            'pred_boxes': cdn_boxes,
         })
         parts['model'].append({
             'pred_logits': model_logits,
             'pred_boxes': model_boxes,
         })
-        
+
     return parts

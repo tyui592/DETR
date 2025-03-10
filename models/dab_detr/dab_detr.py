@@ -87,14 +87,8 @@ class DAB_DETR(nn.Module):
             # fix randomly initialized xy points
             self.query.weight.data[:, :2].requires_grad = False
 
-    def forward(self, img, mask):
-        """Forward.
-
-        img: B, C, H, W
-        mask: B, H, W
-        """
-        bs = img.shape[0]
-
+    def forward(self, img, mask, target=None):
+        """Forward"""
         # feature extraction
         feature = self.backbone(img)
         mask = F.interpolate(mask.unsqueeze(1), feature.shape[2:], mode='nearest')
@@ -105,26 +99,24 @@ class DAB_DETR(nn.Module):
 
         mask = mask.flatten(2).unsqueeze(1).bool()
         f = self.input_proj(feature).flatten(2).permute(0, 2, 1)
+        
+        hs, anchors = self.transformer(f, pos_embed, self.query.weight, mask)
 
-        query = self.query.weight.unsqueeze(0).repeat(bs, 1, 1)
-        hs, anchors, enc_sa, dec_sa, dec_ca = self.transformer(f, pos_embed, query, mask)
-
-        outputs = []
-        for h, anchor in zip(hs, anchors):
-            offset = self.box_embed(h)
-            pred_box = (inverse_sigmoid(anchor) + offset).sigmoid()
-            outputs.append(
-                {
-                    'pred_logits': self.cls_embed(h),
-                    'pred_boxes': pred_box
-                }
-            )
-
-        # To Visualize Attention Weights
-        attns = {
-            'enc_sa': enc_sa,
-            'dec_sa': dec_sa,
-            'dec_ca': dec_ca
-        }
-
-        return outputs, attns
+        if self.training:
+            outputs = {'model': []}
+            for h, anchor in zip(hs, anchors):
+                offset = self.box_embed(h)
+                pred_box = (inverse_sigmoid(anchor) + offset).sigmoid()
+                outputs['model'].append(
+                    {
+                        'pred_logits': self.cls_embed(h),
+                        'pred_boxes': pred_box
+                    }
+                )
+        else:
+            outputs = {
+                'pred_logits': self.cls_embed(hs[-1]),
+                'pred_boxes': (inverse_sigmoid(anchors[-1]) + self.box_embed(hs[-1])).sigmoid()
+            }
+        
+        return outputs

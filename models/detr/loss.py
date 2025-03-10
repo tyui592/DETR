@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from collections import defaultdict
 from models.matcher import HungarianMatcher
 from utils.box_ops import generalized_box_iou, box_cxcywh_to_xyxy
-
+from utils.misc import AverageMeter
 
 def get_detr_criterion(args, device):
     """Get a loss criterion with the arguments."""
@@ -21,6 +21,9 @@ def get_detr_criterion(args, device):
                           n_cls=args.n_cls,
                           cls_loss=args.cls_loss,
                           aux_flag=args.return_intermediate,
+                          l1_weight=args.l1_loss_weight,
+                          giou_weight=args.giou_loss_weight,
+                          cls_weight=args.cls_loss_weight,
                           noobj_weight=args.noobj_cls_weight,
                           focal_gamma=args.focal_gamma,
                           focal_alpha=args.focal_alpha).to(device)
@@ -36,6 +39,9 @@ class Criterion(nn.Module):
                  n_cls: int = 2,
                  cls_loss: str = 'ce',
                  aux_flag: bool = True,
+                 l1_weight: float = 1.0,
+                 giou_weight: float = 1.0,
+                 cls_weight: float = 1.0,
                  noobj_weight: float = 0.1,
                  focal_gamma: float = 2.0,
                  focal_alpha: float = 0.25):
@@ -44,8 +50,12 @@ class Criterion(nn.Module):
         self.matcher = matcher
         self.n_cls = n_cls
         self.aux_flag = aux_flag
+        self.cls_loss = cls_loss
+        self.loss_weights = {'l1': l1_weight,
+                             'giou': giou_weight,
+                             'cls': cls_weight}
 
-        if cls_loss == 'ce':
+        if self.cls_loss == 'ce':
             # class weights
             weight = torch.ones(n_cls + 1)
             weight[-1] = noobj_weight
@@ -54,34 +64,40 @@ class Criterion(nn.Module):
             self.cls_criterion = FocalLoss(alpha=focal_alpha,
                                            gamma=focal_gamma,
                                            n_cls=n_cls)
-
-    def forward(self, outputs, targets):
-        """Forward function."""
-        num_boxes = sum(len(t['labels']) for t in targets)
-
-        if not self.aux_flag:
-            outputs = outputs[-1:]
-
-        losses = defaultdict(list)
-        # calculate losses per each decoder layer
-        for output in outputs:
-            indices = self.matcher(output, targets)
-
-            # box loss
-            l1_loss, giou_loss = self.calc_box_loss(output, targets, indices, num_boxes)
-            losses['l1_loss'].append(l1_loss)
-            losses['giou_loss'].append(giou_loss)
-
-            # class loss
-            cls_loss = self.calc_cls_loss(output, targets, indices, num_boxes)
-            losses['cls_loss'].append(cls_loss)
-
-        return losses
-
-    def calc_box_loss(self, outputs, targets, indices, num_boxes):
+        
+        self.set_summary()
+        return None
+            
+    def _get_src_permutation_idx(self, indices):
+        # permute predictions following indices
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx = torch.cat([src for (src, _) in indices])
+        return batch_idx, src_idx
+    
+    def set_summary(self):
+        self.summary = defaultdict(AverageMeter)  
+        
+    @torch.no_grad()
+    def calc_cardinality(self, outputs, targets):
+        pred_logits = outputs['pred_logits']
+        device = pred_logits.device
+        tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
+        # Count the number of predictions that are NOT "no-object" (which is the last class)
+        card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
+        card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
+        return card_err.item()
+    
+    @torch.no_grad()
+    def calc_top1_accuracy(self, logits, labels):
+        top1_labels = logits.argmax(-1)
+        acc = ((top1_labels == labels).sum()) / len(labels)
+        return acc.item()    
+    
+    def calc_box_loss(self, outputs, targets, indices):
         """Calculate box loss."""
         idx = self._get_src_permutation_idx(indices)
-
+        num_boxes = max(len(idx[0]), 1)
+        
         selected_boxes = outputs['pred_boxes'][idx]
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)])
 
@@ -96,9 +112,10 @@ class Criterion(nn.Module):
 
         return l1_loss, giou_loss
 
-    def calc_cls_loss(self, outputs, targets, indices, num_boxes):
+    def calc_cls_loss(self, outputs, targets, indices, check_acc=False):
         """Calculate class loss."""
         idx = self._get_src_permutation_idx(indices)
+        num_boxes = max(len(idx[0]), 1)
 
         target_cls = torch.full(outputs['pred_logits'].shape[:2],
                                 self.n_cls,
@@ -107,15 +124,63 @@ class Criterion(nn.Module):
         target_cls[idx] = target_cls_o
 
         loss = self.cls_criterion(outputs['pred_logits'].transpose(1, 2), target_cls, num_boxes)
+        
+        if check_acc:
+            top1_acc = self.calc_top1_accuracy(outputs['pred_logits'][idx], target_cls_o)
+            self.summary['top1_acc'].update(top1_acc, n=len(target_cls_o))
+            
         return loss
 
-    def _get_src_permutation_idx(self, indices):
-        # permute predictions following indices
-        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
-        src_idx = torch.cat([src for (src, _) in indices])
-        return batch_idx, src_idx
+    def calc_total_loss(self, losses):
+        """Calcualte the total loss"""
+        
+        # Calculate three losses (l1, giou, cls)
+        total_losses = defaultdict(list)
+        for key, values in losses.items():
+            if 'l1' in key:
+                total_losses['l1'] += values
+            elif 'giou' in key:
+                total_losses['giou'] += values
+            elif 'cls' in key:
+                total_losses['cls'] += values
+        
+        # Weighted sum
+        total_loss = 0
+        for key, weight in self.loss_weights.items():
+            mean = sum(total_losses[key]) / len(total_losses[key])
+            
+            self.summary[key].update(mean, n=len(total_losses[key]))
+            total_loss += mean * weight
+            
+        self.summary['total'].update(total_loss.item(),
+                                     n=len(total_losses[key]))
+        return total_loss
 
+    def forward(self, outputs, targets):
+        """Forward function."""
+        losses = defaultdict(list)
+        # calculate losses per each decoder layer
+        for key in ['model']:
+            _outputs = outputs[key]
+            if not self.aux_flag:
+                _outputs = _outputs[-1:]
+            for output in _outputs:
+                indices = self.matcher(output, targets)
 
+                l1_loss, giou_loss = self.calc_box_loss(output, targets, indices)
+                cls_loss = self.calc_cls_loss(output, targets, indices, key=='model')
+                
+                losses[f'{key}_l1_loss'].append(l1_loss)
+                losses[f'{key}_giou_loss'].append(giou_loss)
+                losses[f'{key}_cls_loss'].append(cls_loss)
+                
+                if key == 'model' and self.cls_loss == 'ce':
+                    cardinality = self.calc_cardinality(output, targets)
+                    self.summary['cardinality'].update(cardinality)
+                
+        total_loss = self.calc_total_loss(losses)
+        return total_loss
+    
 class CrossEntropy(nn.Module):
     """CrossEntropy Class."""
 

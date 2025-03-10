@@ -10,7 +10,7 @@ from utils.misc import inverse_sigmoid
 
 from .backbone import get_backbone
 from .position_encoding import get_pos_embedding
-from .layers import MHA, FeedForward, MLP
+from .layers import MLP
 from .transformer import get_transformer
 
 
@@ -77,14 +77,8 @@ class ConditionalDETR(nn.Module):
         nn.init.normal_(self.query.weight, mean=0.0, std=0.02)
 
 
-    def forward(self, img, mask):
-        """Forward.
-
-        img: B, C, H, W
-        mask: B, H, W
-        """
-        bs = img.shape[0]
-
+    def forward(self, img, mask, target=None):
+        """Forward."""
         # feature extraction
         feature = self.backbone(img)
         mask = F.interpolate(mask.unsqueeze(1), feature.shape[2:], mode='nearest')
@@ -96,26 +90,27 @@ class ConditionalDETR(nn.Module):
         mask = mask.flatten(2).unsqueeze(1).bool()
         f = self.input_proj(feature).flatten(2).permute(0, 2, 1)
 
-        query = self.query.weight.unsqueeze(0).repeat(bs, 1, 1)
-        hs, ref_points, enc_sa, dec_sa, dec_ca = self.transformer(f, pos_embed, query, mask)
+        hs, ref_points = self.transformer(f, pos_embed, self.query.weight, mask)
+        
         ref_points_before_sigmoid = inverse_sigmoid(ref_points)
-
-        outputs = []
-        for h in hs:
-            tmp = self.box_embed(h)
+        if self.training:
+            outputs = {'model': []}
+            for h in hs:
+                tmp = self.box_embed(h)
+                tmp[..., :2] += ref_points_before_sigmoid
+                outputs['model'].append(
+                    {
+                        'pred_logits': self.cls_embed(h),
+                        'pred_boxes': tmp.sigmoid()
+                    }
+                )
+            
+        else:
+            tmp = self.box_embed(hs[-1])
             tmp[..., :2] += ref_points_before_sigmoid
-            outputs.append(
-                {
-                    'pred_logits': self.cls_embed(h),
-                    'pred_boxes': tmp.sigmoid()
-                }
-            )
-
-        # for visualize attention weights
-        attns = {
-            'enc_sa': enc_sa,
-            'dec_sa': dec_sa,
-            'dec_ca': dec_ca
-        }
-
-        return outputs, attns
+            outputs = {
+                'pred_logits': self.cls_embed(hs[-1]),
+                'pred_boxes': tmp.sigmoid()
+            }
+        
+        return outputs

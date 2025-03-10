@@ -9,7 +9,7 @@ from utils.misc import get_logger
 
 if __name__ == '__main__':
     args = get_arguments()
-    logger = get_logger(args.save_root, args.save_root.stem)
+    logger = get_logger(args.save_root / 'logs',args.save_root.stem)
     logger.debug('Check Arguments')
     for k, v in vars(args).items():
         logger.debug(f'{k} = {v}')

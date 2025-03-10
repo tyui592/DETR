@@ -44,7 +44,7 @@ class FocalPostProcess(nn.Module):
     """This module converts the model's output into the format expected by the coco api."""
 
     @torch.no_grad()
-    def forward(self, outputs, target_sizes, topk=200):
+    def forward(self, outputs, target_sizes, topk=300):
         """Perform the computation.
 
         Parameters:
@@ -70,6 +70,12 @@ class FocalPostProcess(nn.Module):
         img_h, img_w = target_sizes.unbind(1)
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
         boxes = boxes * scale_fct[:, None, :]
+        
+        # clamp with image size
+        n_query = boxes.shape[1]
+        u = scale_fct.unsqueeze(1).repeat(1, n_query, 1)
+        l = torch.zeros_like(boxes)
+        boxes = torch.max(torch.min(boxes, u), l)
 
         results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
 

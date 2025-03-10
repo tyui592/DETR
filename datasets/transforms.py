@@ -22,22 +22,15 @@ class Transforms:
     def __init__(self, image_set):
         # config the params for data aug
         scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
-        # scales = [480, 512, 544, 576, 608, 640, 672, 704]
-        #max_size = 960  # 1333
         max_size = 1333
         normalize = Compose([
             ToTensor(),
             Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
 
-        if image_set == 'test':
+        if 'train' in image_set:
             self.transforms = Compose([
-                RandomResize([max(scales)], max_size=max_size),
-                normalize,
-            ])
-
-        else:
-            self.transforms = Compose([
+                # RandomColorJitter(),
                 RandomHorizontalFlip(),
                 RandomSelect(
                     RandomResize(scales, max_size=max_size),
@@ -47,6 +40,12 @@ class Transforms:
                         RandomResize(scales, max_size=max_size),
                     ])
                 ),
+                normalize,
+            ])
+            
+        else:
+            self.transforms = Compose([
+                RandomResize([max(scales)], max_size=max_size),
                 normalize,
             ])
 
@@ -381,3 +380,14 @@ class Compose(object):
             format_string += "    {0}".format(t)
         format_string += "\n)"
         return format_string
+    
+
+class RandomColorJitter(object):
+    def __init__(self, p=0.5):
+        self.p = p
+        self.colorjitter = T.ColorJitter(brightness=0.2)
+        
+    def __call__(self, img, target):
+        if random.random() < self.p:
+            img = self.colorjitter(img)
+        return img, target

@@ -7,7 +7,7 @@
 import torch
 from PIL import Image
 from utils.misc import parse_xml
-from datasets.transforms import get_transforms
+from .transforms import get_transforms
 
 
 def get_shwd_dataloader(args, shuffle=True, drop_last=True):

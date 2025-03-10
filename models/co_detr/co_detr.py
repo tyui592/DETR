@@ -12,10 +12,10 @@ from .backbone import get_backbone
 from .position_encoding import get_pos_embedding
 from .transformer import get_transformer
 from .layers import MLP
-from .dino_func import split_outputs, make_cdn_query
+from .dino_func import make_cdn_query, split_outputs
 
 
-def get_dino_detr(args, device):
+def get_co_detr(args, device):
     """Get a detr model."""
     backbone = get_backbone(args)
     transformer = get_transformer(args)
@@ -23,9 +23,9 @@ def get_dino_detr(args, device):
 
     n_cls = args.n_cls
     if args.cls_loss == 'ce':
-        n_cls += 1
-
-    model = DN_DETR(backbone=backbone,
+        n_cls += 1 # add background class
+        
+    model = Co_DETR(backbone=backbone,
                     transformer=transformer,
                     pos_embedding=pos_embedding,
                     n_query=args.n_query,
@@ -45,8 +45,8 @@ def get_dino_detr(args, device):
     return model
 
 
-class DN_DETR(nn.Module):
-    """DN DETR Model."""
+class Co_DETR(nn.Module):
+    """Co-DETR Model."""
 
     def __init__(self,
                  backbone: nn.Module,
@@ -65,7 +65,8 @@ class DN_DETR(nn.Module):
                  fix_init_xy: bool = False,
                  two_stage_mode: str = 'none',
                  two_stage_share_head: bool = True):
-        """Initialize."""
+        """Initialize.
+        """
         super().__init__()
         self.num_group = num_group
         self.box_noise_scale = box_noise_scale
@@ -73,7 +74,7 @@ class DN_DETR(nn.Module):
         self.d_model = d_model
         self.num_class = n_cls
         self.num_dn_query = num_dn_query
-        self.add_neg_query = add_neg_query
+        self.add_neg_query = add_neg_query # contrastive denoised query
         self.backbone = backbone
         self.transformer = transformer
         self.pos_embedding = pos_embedding
@@ -83,19 +84,22 @@ class DN_DETR(nn.Module):
             nn.GroupNorm(32, d_model),
         )
 
-        # anchor query
         self.two_stage_mode = two_stage_mode
         self.anchor_query = None
         if self.two_stage_mode in ['none', 'static']:
+            # anchor query
             self.anchor_query = nn.Embedding(n_query, 4)
-        
+            
+        # label embedding
+        # 0: cls0, 1: cls1, 2: back, 3: learnable
         self.label_enc = nn.Embedding(self.num_class + 1, d_model - 1)
 
+        # head
         _box_embed = MLP(input_dim=d_model,
-                         hidden_dim=d_model,
-                         activation=activation,
-                         output_dim=4,
-                         num_layers=3)
+                             hidden_dim=d_model,
+                             activation=activation,
+                             output_dim=4,
+                             num_layers=3)
         nn.init.constant_(_box_embed.layers[-1].weight, 0.0)
         nn.init.constant_(_box_embed.layers[-1].bias, 0.0)
 
@@ -130,7 +134,11 @@ class DN_DETR(nn.Module):
                 self.anchor_query.weight.data[:, :2].requires_grad = False
 
     def forward(self, img, mask, targets=None):
-        """Forward"""
+        """Forward.
+
+        img: B, C, H, W
+        mask: B, H, W
+        """
         # feature extraction
         feature = self.backbone(img)
         mask = F.interpolate(mask.unsqueeze(1), feature.shape[2:], mode='nearest')
@@ -140,46 +148,46 @@ class DN_DETR(nn.Module):
         pos_embed = pos_embed.flatten(2).permute(0, 2, 1)
 
         mask = mask.flatten(2).unsqueeze(1).bool()
-        f = self.input_proj(feature).flatten(2).permute(0, 2, 1)
+        image_feature = self.input_proj(feature).flatten(2).permute(0, 2, 1)
         
+        # Make input query and target for denosing queries
         noised_query = None
         if self.training:
             noised_query = make_cdn_query(targets=targets,
-                                 bs=img.shape[0],
-                                 num_group=self.num_group, 
-                                 label_enc=self.label_enc,
-                                 num_class=self.num_class,
-                                 label_noise_scale=self.label_noise_scale,
-                                 box_noise_scale=self.box_noise_scale,
-                                 num_cdn_query=self.num_dn_query,
-                                 add_neg_query=self.add_neg_query,
-                                 device=img.device)
-
-        hs, anchors, enc_ref, memory = self.transformer(img_feature=f,
-                                                        anchor_query=self.anchor_query,
-                                                        pos_embed=pos_embed,
+                                          bs=img.shape[0],
+                                          num_group=self.num_group, 
+                                          label_enc=self.label_enc,
+                                          num_class=self.num_class,
+                                          label_noise_scale=self.label_noise_scale,
+                                          box_noise_scale=self.box_noise_scale,
+                                          num_cdn_query=self.num_dn_query,
+                                          add_neg_query=self.add_neg_query,
+                                          device=img.device)
+        
+        hs, anchors, enc_ref, memory = self.transformer(img_feature=image_feature,
+                                                        img_pos_embed=pos_embed,
                                                         img_mask=mask,
+                                                        anchor_query=self.anchor_query,
                                                         feature_shape=feature.shape,
                                                         noised_query=noised_query,
                                                         label_enc=self.label_enc)
-
+        
         if self.training:
             outputs = []
             for h, anchor in zip(hs, anchors):
                 offset = self.box_embed(h)
-                pred_box = (inverse_sigmoid(anchor) + offset).sigmoid()
                 outputs.append({
                     'pred_logits': self.cls_embed(h),
-                    'pred_boxes': pred_box
+                    'pred_boxes': (inverse_sigmoid(anchor) + offset).sigmoid()
                 })
-            
+
             if self.two_stage_mode != 'none':
                 first_stage = []
                 first_stage.append({
                 'pred_logits': self.transformer.enc_cls_embed(memory),
                 'pred_boxes': (enc_ref + self.transformer.enc_box_embed(memory)).sigmoid()
                 })
-                
+
             # Split matching part and denosing part
             num_dn_query = self.num_dn_query * self.num_group
             if self.add_neg_query:
@@ -188,11 +196,10 @@ class DN_DETR(nn.Module):
             outputs['cdn_targets'] = noised_query['targets']
             outputs['cdn_indices'] = noised_query['indices']
             outputs['first_stage'] = first_stage
-            
         else:
             outputs = {
                 'pred_logits': self.cls_embed(hs[-1]),
                 'pred_boxes': (inverse_sigmoid(anchors[-1]) + self.box_embed(hs[-1])).sigmoid()
-            }
+                }
         
         return outputs

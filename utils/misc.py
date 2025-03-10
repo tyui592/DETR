@@ -89,26 +89,19 @@ def get_logger(path, name):
 
 
 @torch.no_grad()
-def draw_outputs(inputs, targets, results, topk=10, num_image=2):
-    _mean = (0.485, 0.456, 0.406)
-    _std = (0.229, 0.224, 0.225)
-    mean = [-m / s for m, s in zip(_mean, _std)]
-    std = [1 / s for s in _std]
+def draw_outputs(inputs, targets, results, num_image=2):
+    mean = [-m / s for m, s in zip((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))]
+    std = [1 / s for s in (0.229, 0.224, 0.225)]
     pils = []
-    colors = {0: 'red', 1: 'blue', 2: 'green', 3: 'yellow'}
+    colors = {0: 'red', 1: 'blue', 2: 'black'}
+    colors_gt = {0: 'green', 1: 'yellow'}
     imgs = TF.normalize(inputs['images'], mean=mean, std=std)
     for i in range(num_image):
-        result = results[i]
-        scores = result['scores']
-        boxes = result['boxes']
-        labels = result['labels']
-        _, topk_indices = torch.topk(scores, topk)
-        topk_boxes = boxes[topk_indices].cpu().tolist()
-        topk_labels = labels[topk_indices].cpu().tolist()
-
         pil = TF.to_pil_image(imgs[i].cpu())
+        
         # draw predictions
-        for box, label in zip(topk_boxes, topk_labels):
+        for box, label in zip(results[i]['boxes'].tolist(),
+                              results[i]['labels'].tolist()):
             pil = draw_box(pil, box, color=colors[label])
 
         # draw gt boxes
@@ -116,8 +109,8 @@ def draw_outputs(inputs, targets, results, topk=10, num_image=2):
             h, w = inputs['sizes'][i]
             box_scale = torch.tensor([[w, h, w, h]])
             gt_boxes = box_cxcywh_to_xyxy(targets[i]['boxes'].cpu()) * box_scale.cpu()
-            for box, label in zip(gt_boxes, targets[i]['labels']):
-                pil = draw_box(pil, box, color=colors[i + 2])
+            for box, label in zip(gt_boxes, targets[i]['labels'].tolist()):
+                pil = draw_box(pil, box, color=colors_gt[label])
         pils.append(pil)
 
     return pil_concat_h(pils)

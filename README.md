@@ -29,6 +29,10 @@ NOTE: The average number of objects per image in this dataset is 16, which is hi
   - [X] Noised negative queries
   - [ ] Mixed query selection (two-stage)
   - [ ] Look forward twice  
+- Co DETR
+  - [x] Two-stage Detection
+  - [x] Train encoder with ATSS 
+  - [ ] Multiple Auxiliary Heads
 
 ### Experimental Results
 * Model performance (mAP)

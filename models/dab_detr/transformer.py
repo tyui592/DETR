@@ -23,6 +23,7 @@ def get_transformer(args):
                               decoder_sa_position_mode=args.decoder_sa_position_mode,
                               decoder_ca_position_mode=args.decoder_ca_position_mode,
                               query_scale_mode=args.query_scale_mode,
+                              decoder_temperature=args.temperature,
                               num_pattern=args.num_pattern,
                               modulate_wh_attn=args.modulate_wh_attn)
     return transformer
@@ -41,6 +42,7 @@ class Transformer(nn.Module):
                  activation: str = 'relu',
                  p_drop: float = 0.0,
                  encoder_position_mode: str = 'add',
+                 decoder_temperature: int = 10000,
                  decoder_sa_position_mode: str = 'add',
                  decoder_ca_position_mode: str = 'cat',
                  query_scale_mode: str = 'diag',
@@ -64,6 +66,7 @@ class Transformer(nn.Module):
                                activation=activation,
                                return_intermediate=return_intermediate,
                                p_drop=p_drop,
+                               temperature=decoder_temperature,
                                sa_position_mode=decoder_sa_position_mode,
                                ca_position_mode=decoder_ca_position_mode,
                                query_scale_mode=query_scale_mode,
@@ -87,22 +90,22 @@ class Transformer(nn.Module):
 
         f: image feuatre (batch size x HW x d_model)
         pos_embed: positional embedding for encoder (batch_size x HW x d_model)
-        query: anchor query (batch size x num_query x 4)
+        query: anchor query (num_query x 4)
         """
-        memory, enc_sa = self.encoder(f, pos_embed, mask)
+        memory = self.encoder(f, pos_embed, mask)
 
-        bs = f.shape[0]  # batch size
-        d_model = f.shape[-1]  # d_model
-        nq = query.shape[1]  # num query
+        bs, _, d_model = f.shape
+        num_query = query.shape[0]
         if hasattr(self, 'patterns'):
-            np = self.patterns.weight.shape[0]  # num pattern
-            x = self.patterns.weight.unsqueeze(0).unsqueeze(1).repeat(bs, nq, 1, 1).flatten(1, 2)
-            query = query.repeat(1, np, 1)  # bs, nq * np, 4
+            num_pattern = self.patterns.weight.shape[0]
+            x = self.patterns.weight[None, None, ...].repeat(bs, num_query, 1, 1).flatten(1, 2)
+            query = query.unsqueeze(0).repeat(bs, num_pattern, 1)
         else:
-            x = torch.zeros(bs, nq, d_model, device=f.device)
-        h_s, anchors, dec_sa, dec_ca = self.decoder(x, memory, pos_embed, query, mask)
+            x = torch.zeros(bs, num_query, d_model, device=f.device)
+            query = query.unsqueeze(0).repeat(bs, 1, 1)
+        h_s, anchors = self.decoder(x, memory, pos_embed, query, mask)
 
-        return h_s, anchors, enc_sa, dec_sa, dec_ca
+        return h_s, anchors
 
 
 class Encoder(nn.Module):
@@ -131,8 +134,8 @@ class Encoder(nn.Module):
     def forward(self, x, pos_embed, mask=None):
         """Forward function."""
         for layer in self.layers:
-            x, sa = layer(x, pos_embed, mask)
-        return x, sa
+            x = layer(x, pos_embed, mask)
+        return x
 
 
 class EncoderLayer(nn.Module):
@@ -181,7 +184,7 @@ class EncoderLayer(nn.Module):
 
         y = self.ff(x)
         x = self.norm2(x + self.dropout2(y))
-        return x, attention
+        return x
 
 
 class Decoder(nn.Module):
@@ -195,6 +198,7 @@ class Decoder(nn.Module):
                  activation: str = 'relu',
                  return_intermediate: bool = False,
                  p_drop: float = 0.1,
+                 temperature: int = 10000,
                  sa_position_mode: str = 'add',
                  ca_position_mode: str = 'cat',
                  query_scale_mode: str = 'diag',
@@ -204,7 +208,7 @@ class Decoder(nn.Module):
         modulate_wh_attn: edit positional attention weight scale info(w, h)
         """
         super().__init__()
-
+        self.t = temperature
         self.layers = nn.ModuleList([
             DecoderLayer(d_model=d_model,
                          n_heads=n_heads,
@@ -260,7 +264,7 @@ class Decoder(nn.Module):
 
         for index, layer in enumerate(self.layers):
             # generate a pos embed with anchor
-            query_sine_embed = gen_sineembed_for_position(anchor, d_model)
+            query_sine_embed = gen_sineembed_for_position(anchor, self.t, d_model)
 
             # transform to get pos embed in self-attn
             sa_pos_embed = self.ref_point_head(query_sine_embed)
@@ -276,7 +280,7 @@ class Decoder(nn.Module):
                 ca_pos_embed[..., d_model // 2:] *= (wh_ref[..., 0] / anchor[..., 2]).unsqueeze(-1)
                 ca_pos_embed[..., :d_model // 2] *= (wh_ref[..., 1] / anchor[..., 3]).unsqueeze(-1)
 
-            x, sa, ca = layer(x, memory, pos_embed, sa_pos_embed, ca_pos_embed, mask, is_first=index == 0)
+            x = layer(x, memory, pos_embed, sa_pos_embed, ca_pos_embed, mask, is_first=index == 0)
 
             # iter update
             if self.box_embed is not None:
@@ -296,7 +300,7 @@ class Decoder(nn.Module):
         if not self.return_intermediate:
             xs.append(x)
 
-        return xs, anchors, sa, ca
+        return xs, anchors
 
 
 class DecoderLayer(nn.Module):
@@ -425,10 +429,10 @@ class DecoderLayer(nn.Module):
         ########################
         y = self.ff(x)
         x = self.norm3(x + self.dropout3(y))
-        return x, self_attention, cross_attention
+        return x
 
 
-def gen_sineembed_for_position(pos_tensor, d_model=256):
+def gen_sineembed_for_position(pos_tensor, temperature=10000, d_model=256):
     """Generate sine embedding.
 
     - pos tensor has 3-dim(bs, n_query, 4)
@@ -436,7 +440,7 @@ def gen_sineembed_for_position(pos_tensor, d_model=256):
     """
     scale = 2 * math.pi
     dim_t = torch.arange(d_model // 2, dtype=torch.float32, device=pos_tensor.device)
-    dim_t = 10000 ** (2 * (dim_t // 2) / (d_model // 2))
+    dim_t = temperature ** (2 * (dim_t // 2) / (d_model // 2))
     x_embed = pos_tensor[:, :, 0] * scale
     y_embed = pos_tensor[:, :, 1] * scale
     pos_x = x_embed[:, :, None] / dim_t

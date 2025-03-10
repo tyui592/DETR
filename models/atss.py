@@ -5,9 +5,10 @@ from torchvision.ops import box_iou
 from utils.box_ops import box_cxcywh_to_xyxy
 
 class ATSS(torch.nn.Module):
-    def __init__(self, k):
+    def __init__(self, k, threshold='mean+std'):
         super().__init__()
         self.k = k
+        self.threshold = threshold
         
     @torch.no_grad()
     def forward(self, outputs, targets):
@@ -31,12 +32,19 @@ class ATSS(torch.nn.Module):
 
                 # compute ious
                 ious = box_iou(box_cxcywh_to_xyxy(gt_box[None, :]),
-                            box_cxcywh_to_xyxy(k_boxes))
-                threshold = torch.mean(ious) + torch.std(ious)
+                               box_cxcywh_to_xyxy(k_boxes))
+                
+                # calculate iou threshold
+                if self.threshold == 'mean':
+                    threshold = torch.mean(ious)
+                elif self.threshold == 'mean+std':
+                    threshold = torch.mean(ious) + torch.std(ious)
 
                 # for loop by positive candidnates(Cg)
                 for k, iou in enumerate(ious[0]):
                     cx, cy = k_boxes[k][:2]
+
+                    # iou and spatial condition
                     if iou > threshold and (x1 <= cx <= x2) and (y1 <= cy <= y2):
                         temp_indices[0].append(k_indices[i][k].item())
                         temp_indices[1].append(i)
@@ -56,6 +64,7 @@ class ModifiedATSS(torch.nn.Module):
         for target, pred_box in zip(targets, pred_boxes):
             temp_indices = [[], []]
             gt_boxes = target['boxes'].to(pred_box.device)
+
             if gt_boxes.shape[0] == 0:
                 indices.append(temp_indices)
                 continue
@@ -67,9 +76,9 @@ class ModifiedATSS(torch.nn.Module):
             # for loop by GT box(g)
             temp_indices = [[], []]
             for i, (gt_box, k_boxes)in enumerate(zip(gt_boxes, k_boxes_per_gt)):
-                # compute ious
+                # ious
                 ious = box_iou(box_cxcywh_to_xyxy(gt_box[None, :]),
-                            box_cxcywh_to_xyxy(k_boxes))
+                               box_cxcywh_to_xyxy(k_boxes))
 
                 _, ks = torch.topk(ious, self.n)
                 for k in ks[0]:

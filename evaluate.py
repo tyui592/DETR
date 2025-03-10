@@ -15,7 +15,7 @@ def evaluate_model(args, logger):
     dataloader = get_dataloader(args, shuffle=False, drop_last=False)
 
     # load a trained model weights
-    model, criterion, postprocessor = get_model(args, device)
+    model, _, postprocessor = get_model(args, device)
 
     ckpt = torch.load(args.eval_model_path,
                       map_location=device,
@@ -25,7 +25,7 @@ def evaluate_model(args, logger):
     logger.info((f"Load the model weights from '{args.eval_model_path}', "
                  f"Trained steps/epochs: {ckpt['step']}/{ckpt['epoch']}"))
 
-    results = evaluate_step(model, dataloader, postprocessor, logger, args, device)
+    results = evaluate_step(model, dataloader, postprocessor, args, device)
 
     # save evaluation results
     for file_id, s in results.items():
@@ -36,7 +36,7 @@ def evaluate_model(args, logger):
 
 
 @torch.no_grad()
-def evaluate_step(model, dataloader, postprocessor, logger, args, device):
+def evaluate_step(model, dataloader, postprocessor, args, device):
     """Evaluate with a dataloader."""
     def _to_str(boxes, probs, labels):
         s = []
@@ -46,15 +46,14 @@ def evaluate_step(model, dataloader, postprocessor, logger, args, device):
         return '\n'.join(s)
 
     res = {}
-    for inputs, targets in tqdm(dataloader):
+    for inputs, _ in tqdm(dataloader):
         with torch.inference_mode():
-            outputs, _ = model(inputs['images'].to(device),
-                               inputs['masks'].to(device))
+            output = model(inputs['images'].to(device), inputs['masks'].to(device))
 
         # use last layer's output
-        results = postprocessor(outputs[-1], inputs['raw_sizes'].to(device))
+        results = postprocessor(output, inputs['raw_sizes'].to(device))
 
-        for result, target, file_id in zip(results, targets, inputs['file_ids']):
+        for result, file_id in zip(results, inputs['file_ids']):
             res[file_id] = _to_str(result['boxes'], result['scores'], result['labels'])
 
     return res

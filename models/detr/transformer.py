@@ -65,12 +65,15 @@ class Transformer(nn.Module):
 
     def forward(self, f, pos_embed, query, mask):
         """Forward function."""
-        memory, enc_sa = self.encoder(f, pos_embed, mask)
-
+        memory = self.encoder(f, pos_embed, mask)
+        
+        bs = f.shape[0]
+        query = query.unsqueeze(0).repeat(bs, 1, 1)
         x = torch.zeros_like(query)
-        hs, dec_sa, dec_ca = self.decoder(x, memory, pos_embed, query, mask)
+        
+        hs = self.decoder(x, memory, pos_embed, query, mask)
 
-        return hs, enc_sa, dec_sa, dec_ca
+        return hs
 
 
 class Encoder(nn.Module):
@@ -104,8 +107,8 @@ class Encoder(nn.Module):
     def forward(self, x, pos_embed, mask=None):
         """Forward."""
         for layer in self.layers:
-            x, sa = layer(x, pos_embed, mask)
-        return x, sa
+            x = layer(x, pos_embed, mask)
+        return x
 
 
 class EncoderLayer(nn.Module):
@@ -154,7 +157,7 @@ class EncoderLayer(nn.Module):
 
         y = self.ff(x)
         x = self.norm2(x + self.dropout2(y))
-        return x, attention
+        return x
 
 
 class Decoder(nn.Module):
@@ -193,14 +196,14 @@ class Decoder(nn.Module):
         """Forward."""
         xs = []
         for layer in self.layers:
-            x, sa, ca = layer(x, memory, pos_embed, query, mask)
+            x = layer(x, memory, pos_embed, query, mask)
             if self.return_intermediate:
                 xs.append(x)
 
         if not self.return_intermediate:
             xs.append(x)
 
-        return xs, sa, ca
+        return xs
 
 
 class DecoderLayer(nn.Module):
@@ -283,4 +286,4 @@ class DecoderLayer(nn.Module):
         # feed-forward
         y = self.ff(x)
         x = self.norm3(x + self.dropout3(y))
-        return x, self_attention, cross_attention
+        return x

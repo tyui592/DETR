@@ -2,6 +2,7 @@
 
 import torch
 import torchvision
+from collections import defaultdict
 from utils.misc import inverse_sigmoid
 from utils.box_ops import box_cxcywh_to_xyxy
 
@@ -35,59 +36,49 @@ def generate_noised_neg_boxes(existing_boxes,
     return torch.tensor(result[:num_boxes])
 
 
-def preprocessing_for_dino(targets: list = None,
-                           query: torch.tensor = None,
-                           batch_size: int = 4,
-                           num_group: int = 5,
-                           d_model: int = 256,
-                           label_enc: torch.nn.Embedding = None,
-                           num_class: int = 2,
-                           label_noise_scale: float = 0.2,
-                           box_noise_scale: float = 0.4,
-                           num_dn_query: int = 100,
-                           add_neg_query: bool = True,
-                           training: bool = True):
-    bs = batch_size
-    num_query = query.shape[0]
-    device = query.device
-
-    # model label query
-    model_label_query = label_enc(torch.tensor(num_class, device=device)).repeat(num_query, 1)
-    indicator0 = torch.zeros([num_query, 1], device=device)
-    model_label_query = torch.cat([model_label_query, indicator0], dim=1)
-
-    if not training:
-        model_label_query = model_label_query.unsqueeze(0).repeat(bs, 1, 1)
-        model_box_query = query.unsqueeze(0).repeat(bs, 1, 1)
-        return (model_box_query, model_label_query), None, None
-
-    if num_dn_query > 0:
-        max_obj = num_dn_query # fix number of dn query for efficiency
+def make_cdn_query(targets: list = None,
+                   bs: int = 4,
+                   num_group: int = 5,
+                   label_enc: torch.nn.Embedding = None,
+                   num_class: int = 2,
+                   label_noise_scale: float = 0.2,
+                   box_noise_scale: float = 0.4,
+                   num_cdn_query: int = 100,
+                   add_neg_query: bool = True,
+                   device = torch.device('cpu')):
+    """Make noised positive and negative queies with targets.
+    
+    """
+    # label query(embedding) of model(learnable) query
+    if num_cdn_query > 0:
+        max_obj = num_cdn_query # fix number of noised query
     else:
-        # adpatively make dn queries
+        # adpatively make noised queries by maximum number of object in batch
         num_obj_lst = [len(t['labels']) for t in targets]
         max_obj = max(num_obj_lst)
 
-    dn_indices, dn_targets = [], []
-    indicator1 = torch.ones([1, 1, 1], device=device).repeat(bs, 1, 1)
+    cdn_indices, cdn_targets = [], []
     noised_labels = torch.randint(0, num_class, size=(bs, num_group, max_obj), device=device)
     noised_boxes = torch.rand(bs, num_group, max_obj, 4, device=device)
 
     if add_neg_query:
         neg_labels = torch.randint(0, num_class, size=(bs, num_group, max_obj), device=device)
-        neg_boxes = torch.rand(bs, num_group, max_obj, 4, device=device)
-
+        neg_boxes = torch.rand(bs, num_group, max_obj, 4, device=device) # dummy
+    
     for i, target in enumerate(targets):
         boxes = target['boxes']
         labels = target['labels']
         num_obj = len(labels)
+        
+        # When the image has a foreground object
         if num_obj > 0:
+            # Create negative boxes that does not overlap the GT Box.
             if add_neg_query:
                 _neg_boxes = generate_noised_neg_boxes(boxes,
                                                        num_boxes=max_obj * num_group).to(device)
                 neg_boxes[i] = _neg_boxes.view(num_group, max_obj, -1)
 
-            # If the number of objects is less than the target number, additional objects are sampled.
+            # If the number of objects is less than the target(num_cdn_query) number, more objects are sampled.
             if num_obj < max_obj:
                 add_num = max_obj - num_obj
                 idx = torch.randint(0, num_obj, (add_num,))
@@ -95,12 +86,11 @@ def preprocessing_for_dino(targets: list = None,
                 add_labels = labels[idx]
                 boxes = torch.cat([boxes, add_boxes], dim=0)
                 labels = torch.cat([labels, add_labels], dim=0)
-            # If the number of objects is greater than the target number, some of them are sampled.
             elif num_obj > max_obj:
                 idx = torch.randint(0, num_obj, (max_obj,))
                 boxes = boxes[idx]
                 labels = labels[idx]
-
+            
             boxes = boxes.repeat(num_group, 1).view(num_group, max_obj, -1)
             labels = labels.repeat(num_group).view(num_group, max_obj)
 
@@ -127,14 +117,14 @@ def preprocessing_for_dino(targets: list = None,
         # indices for loss calculation
         num_pos = max_obj if num_obj != 0 else num_obj
         idx = torch.arange(num_pos).unsqueeze(0).repeat(num_group, 1)
-        offset0 = torch.arange(num_group).unsqueeze(1) * num_pos * 2
+        offset0 = torch.arange(num_group).unsqueeze(1) * num_pos * (2 if add_neg_query else 1)
         offset1 = torch.arange(num_group).unsqueeze(1) * num_pos
         indices0 = (idx + offset0).view(-1)
         indices1 = (idx + offset1).view(-1)
-        dn_indices.append((indices0, indices1))
+        cdn_indices.append((indices0, indices1))
 
         # targets for loss calculation
-        dn_targets.append({'boxes': boxes.to(device),
+        cdn_targets.append({'boxes': boxes.to(device),
                            'labels': labels.to(device)})
 
     if add_neg_query:
@@ -143,46 +133,50 @@ def preprocessing_for_dino(targets: list = None,
     else:
         cdn_labels = noised_labels
         cdn_boxes = noised_boxes
+        
     cdn_labels = cdn_labels.flatten(1, 2)
     cdn_boxes = cdn_boxes.flatten(1, 2)
+    
+    indicator1 = torch.ones([1, 1, 1], device=device).repeat(bs, cdn_labels.shape[1], 1)
+    cdn_label_query = torch.cat([label_enc(cdn_labels), indicator1], dim=-1)
 
-    # concatenate group part and matching part
-    group_label_query = torch.cat([label_enc(cdn_labels),
-                                   indicator1.repeat(1, cdn_labels.shape[1], 1)], dim=2)
-    cdn_label_query = torch.cat([group_label_query,
-                                 model_label_query.unsqueeze(0).repeat(bs, 1, 1)], dim=1)
-
-    group_box_query = inverse_sigmoid(cdn_boxes)
-    cdn_box_query = torch.cat([group_box_query,
-                               query.unsqueeze(0).repeat(bs, 1, 1)], dim=1)
-
+    cdn_box_query = inverse_sigmoid(cdn_boxes)
+    
     # decoder's self-attention mask
     num_total_query = cdn_label_query.shape[1]
     group_size = max_obj
     if add_neg_query:
         group_size *= 2
-    attention_mask = torch.zeros((1, 1, num_total_query, num_total_query), device=device)
+    attn_mask = torch.zeros((num_total_query, num_total_query), device=device)
     for i in range(num_group):
-        attention_mask[:, :, i * group_size:(i + 1) * group_size, i * group_size:(i + 1) * group_size] = 1
-        if i == num_group - 1:
-            attention_mask[:, :, :, (i + 1) * group_size:] = 1
+        attn_mask[i * group_size:(i + 1) * group_size, i * group_size:(i + 1) * group_size] = 1
+    
+    cdn = {
+        'anchor_query': cdn_box_query,
+        'label_query': cdn_label_query,
+        'targets': cdn_targets,
+        'indices': cdn_indices,
+        'attn_mask': attn_mask,
+        }
+    return cdn
 
-    return (cdn_box_query, cdn_label_query), (dn_targets, dn_indices), attention_mask
 
-
-def postprocessing_for_dino(outputs, targets, num_query):
-    matching_part = []
-    denoising_part = []
-    for i, output in enumerate(outputs):
+def split_outputs(outputs, num_dn_query):
+    parts = defaultdict(list)
+    for output in outputs:
         pred_logits = output['pred_logits']
         pred_boxes = output['pred_boxes']
-        matching_part.append({
-            'pred_logits': pred_logits[:, -num_query:],
-            'pred_boxes': pred_boxes[:, -num_query:]
+        n = pred_logits.shape[1]
+        sizes = [num_dn_query, n-num_dn_query]
+        cdn_logits, model_logits = pred_logits.split(sizes, dim=1)
+        cdn_boxes, model_boxes = pred_boxes.split(sizes, dim=1)
+        parts['cdn'].append({
+            'pred_logits': cdn_logits,
+            'pred_boxes': cdn_boxes,
         })
-        denoising_part.append({
-            'pred_logits': pred_logits[:, :-num_query],
-            'pred_boxes': pred_boxes[:, :-num_query],
+        parts['model'].append({
+            'pred_logits': model_logits,
+            'pred_boxes': model_boxes,
         })
 
-    return matching_part, denoising_part
+    return parts

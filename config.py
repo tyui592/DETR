@@ -28,18 +28,14 @@ def build_parser():
     # Model
     parser.add_argument('--model',
                         type=str,
-                        choices=['detr', 'conditional_detr', 'dab-detr', 'dn-detr', 'dino-detr'],
+                        choices=['detr', 'conditional_detr', 'dab-detr',
+                                 'dn-detr', 'dino-detr', 'co-detr'],
                         default='detr')
 
     parser.add_argument('--n_query',
                         type=int,
                         help='number of detector query',
-                        default=600)
-
-    parser.add_argument('--require_target',
-                        action='store_true',
-                        help='require target to model input for dn and dino',
-                        default=False)                        
+                        default=300)
 
     parser.add_argument('--d_model',
                         type=int,
@@ -71,7 +67,7 @@ def build_parser():
                         choices=['convnext_tiny',
                                  'resnet18', 'resnet34',
                                  'resnet50', 'resnet50_dc5'],
-                        default='resnet34')
+                        default='resnet50')
 
     parser.add_argument('--layer_index',
                         type=int,
@@ -115,7 +111,7 @@ def build_parser():
                         action='store_true',
                         help='for decoder learning with aux loss',
                         default=False)
-
+    
     parser.add_argument('--pos_embedding',
                         type=str,
                         help='positional embedding method',
@@ -138,7 +134,7 @@ def build_parser():
     parser.add_argument('--num_pattern',
                         type=int,
                         help='(DAB-DETR), Number of patterns for anchors',
-                        default=3)
+                        default=0)
 
     parser.add_argument('--modulate_wh_attn',
                         action='store_true',
@@ -154,7 +150,7 @@ def build_parser():
                         type=str,
                         help='(DAB-DETR) Iteratively update anchors',
                         choices=['relu', 'gelu', 'linear', 'prelu'],
-                        default='prelu')
+                        default='relu')
 
     parser.add_argument('--fix_init_xy',
                         action='store_true',
@@ -186,6 +182,21 @@ def build_parser():
                         action='store_true',
                         help='(DINO) Add Negative query in the group',
                         default=False)
+    # Two stage
+    parser.add_argument('--two_stage_mode',
+                        type=str,
+                        choices=['none', 'static', 'pure', 'mix'],
+                        help='"none": not use, "add": concat encoders output with learnable query and cdn query during training, "pure" and "mix": use encoders output as model query',
+                        default='none')
+        
+    parser.add_argument('--two_stage_share_head',
+                        action='store_true',
+                        default=False)
+    
+    parser.add_argument('--num_encoder_query',
+                        type=int,
+                        default=100)
+
 
     # Data
     parser.add_argument('--dataset',
@@ -197,11 +208,6 @@ def build_parser():
                         type=Path,
                         help='data root',
                         default='../VOC2028/')
-
-    parser.add_argument('--aug_policy',
-                        type=int,
-                        help='0: test, 1 ~ N: train',
-                        default=1)
 
     parser.add_argument('--image_set',
                         type=str,
@@ -259,6 +265,10 @@ def build_parser():
                         type=float,
                         default=0.1)
     # Matcher
+    parser.add_argument('--cls_match_weight',
+                        type=float,
+                        default=2.0)
+    
     parser.add_argument('--l1_match_weight',
                         type=float,
                         default=5.0)
@@ -266,10 +276,16 @@ def build_parser():
     parser.add_argument('--giou_match_weight',
                         type=float,
                         default=2.0)
-
-    parser.add_argument('--cls_match_weight',
-                        type=float,
-                        default=2.0)
+    
+    # ATSS
+    parser.add_argument('--atss_mode',
+                        type=str,
+                        choices=['none', 'atss', 'atss_mean', 'matss'],
+                        default='none')
+    
+    parser.add_argument('--atss_k',
+                        type=int,
+                        default=20)
 
     # Loss
     parser.add_argument('--cls_loss',
@@ -287,15 +303,15 @@ def build_parser():
                         help='pos vs neg balance factor, -1 no weighting',
                         default=0.25)
 
+    parser.add_argument('--cls_loss_weight',
+                        type=float,
+                        default=2.0)
+    
     parser.add_argument('--l1_loss_weight',
                         type=float,
                         default=5.0)
 
     parser.add_argument('--giou_loss_weight',
-                        type=float,
-                        default=2.0)
-
-    parser.add_argument('--cls_loss_weight',
                         type=float,
                         default=2.0)
 
@@ -356,33 +372,37 @@ def build_parser():
 
 # For model evaluation.
 MODEL_SPEC = [
-    'dataset', 'model', 'cls_loss', 'aug_policy',
-    'backbone', 'layer_index', 'n_encoder_layers', 'n_decoder_layers',
+    # DETR
+    'dataset', 'model', 'cls_loss',
+    'backbone', 'layer_index','n_encoder_layers', 'n_decoder_layers',
     'n_query', 'd_model', 'image_size', 'n_heads', 'd_ff', 'pos_embedding',
-    'activation', 'return_intermediate', 'p_drop', 'encoder_position_mode',
-    'decoder_sa_position_mode', 'temperature',
+    'activation', 'return_intermediate', 'p_drop', 'temperature',
+    'encoder_position_mode', 'decoder_sa_position_mode', 
 
-    # Conditional DETR and DAB-DETR
-    'query_scale_mode', 'decoder_ca_position_mode',
+    # Conditional DETR 
+    'decoder_ca_position_mode', 'query_scale_mode', 
 
     # DAB-DETR
     'transformer_activation', 'num_pattern', 'modulate_wh_attn', 'iter_update',
 
     # DN-DETR, DINO-DETR
     'num_group', 'box_noise_scale', 'label_noise_scale',
+    
+    # Two-stage (DINO-DETR, Co-DETR)
+    'two_stage_mode', 'two_stage_share_head', 'num_encoder_query',
 ]
 
 
 def get_arguments():
     """Get arguments."""
     args = build_parser()
-
+    args.save_root.mkdir(exist_ok=True, parents=True)
+    log_path = args.save_root / 'logs'
+    log_path.mkdir(exist_ok=True)
+    
     if args.mode == 'train':
         set_random_seed(args.seed, True)
-        args.save_root.mkdir(exist_ok=True, parents=True)
         save_dict(args.save_root / 'argument.pickle', args)
-        if 'dn' in args.model or 'dino' in args.model:
-            args.require_target = True
     else:
         # load args from the target experiment dir
         # and update args for load model weights.
@@ -391,8 +411,6 @@ def get_arguments():
         loaded_args = load_dict(arg_path)
         args = copy_target_args(loaded_args, args, MODEL_SPEC)
         args.image_set = 'test'
-        args.save_root.mkdir(exist_ok=True, parents=True)
-
     return args
 
 

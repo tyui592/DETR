@@ -11,7 +11,7 @@ from .backbone import get_backbone
 from .position_encoding import get_pos_embedding
 from .transformer import get_transformer
 from .layers import MLP
-from .dn_func import preprocessing_for_dn, postprocessing_for_dn
+from .dn_func import make_cdn_query, split_outputs
 
 
 def get_dn_detr(args, device):
@@ -72,7 +72,7 @@ class DN_DETR(nn.Module):
                                     kernel_size=1)
 
         # anchor query
-        self.query = nn.Embedding(n_query, 4)
+        self.anchor_query = nn.Embedding(n_query, 4)
         self.label_enc = nn.Embedding(self.num_class + 1, d_model - 1)
 
         self.box_embed = MLP(input_dim=d_model,
@@ -96,19 +96,15 @@ class DN_DETR(nn.Module):
 
         nn.init.normal_(self.label_enc.weight.data, mean=0.0, std=0.02)
 
-        nn.init.uniform_(self.query.weight.data[:, :2], 0.0, 1.0)
-        nn.init.uniform_(self.query.weight.data[:, 2:], 0.0, 0.5)
-        self.query.weight.data = inverse_sigmoid(self.query.weight.data)
+        nn.init.uniform_(self.anchor_query.weight.data[:, :2], 0.0, 1.0)
+        nn.init.uniform_(self.anchor_query.weight.data[:, 2:], 0.0, 0.5)
+        self.anchor_query.weight.data = inverse_sigmoid(self.anchor_query.weight.data)
         if fix_init_xy:
             # fix randomly initialized xy points
-            self.query.weight.data[:, :2].requires_grad = False
+            self.anchor_query.weight.data[:, :2].requires_grad = False
 
     def forward(self, img, mask, targets=None):
-        """Forward.
-
-        img: B, C, H, W
-        mask: B, H, W
-        """
+        """Forward."""
         # feature extraction
         feature = self.backbone(img)
         mask = F.interpolate(mask.unsqueeze(1), feature.shape[2:], mode='nearest')
@@ -118,53 +114,43 @@ class DN_DETR(nn.Module):
         pos_embed = pos_embed.flatten(2).permute(0, 2, 1)
 
         mask = mask.flatten(2).unsqueeze(1).bool()
-        f = self.input_proj(feature).flatten(2).permute(0, 2, 1)
+        img_feature = self.input_proj(feature).flatten(2).permute(0, 2, 1)
 
-        ##########
-        ### DN ###
-        ##########
-        dn_inputs, dn_targets, attn_mask = preprocessing_for_dn(targets=targets,
-                                                                batch_size=img.shape[0],
-                                                                query=self.query.weight,
-                                                                num_group=self.num_group,
-                                                                d_model=self.d_model,
-                                                                label_enc=self.label_enc,
-                                                                num_class=self.num_class,
-                                                                label_noise_scale=self.label_noise_scale,
-                                                                box_noise_scale=self.box_noise_scale,
-                                                                training=self.training)
-        input_box_query, input_label_query = dn_inputs
-
-        hs, anchors, enc_sa, dec_sa, dec_ca = self.transformer(f,
-                                                               input_label_query,
-                                                               pos_embed,
-                                                               input_box_query,
-                                                               mask,
-                                                               attn_mask)
-
-        outputs = []
-        for h, anchor in zip(hs, anchors):
-            offset = self.box_embed(h)
-            pred_box = (inverse_sigmoid(anchor) + offset).sigmoid()
-            outputs.append({
-                'pred_logits': self.cls_embed(h),
-                'pred_boxes': pred_box
-            })
-
-        ##########
-        ### DN ###
-        ##########
+        noised_query = None
         if self.training:
-            outputs, dn_outputs = postprocessing_for_dn(outputs, targets, self.num_group)
+            noised_query = make_cdn_query(targets=targets,
+                                          num_group=self.num_group, 
+                                          label_enc=self.label_enc,
+                                          num_class=self.num_class,
+                                          label_noise_scale=self.label_noise_scale,
+                                          box_noise_scale=self.box_noise_scale,
+                                          device=img.device)
 
-        # to visualize attention weights
-        attns = {
-            'enc_sa': enc_sa,
-            'dec_sa': dec_sa,
-            'dec_ca': dec_ca,
-            'attn_mask': attn_mask
-        }
+        hs, anchors = self.transformer(img_feature=img_feature,
+                                       img_pos_embed=pos_embed,
+                                       img_mask=mask,
+                                       anchor_query=self.anchor_query,
+                                       noised_query=noised_query,
+                                       label_enc=self.label_enc)
 
         if self.training:
-            return (outputs, (dn_outputs, dn_targets)), attns,
-        return outputs, attns
+            outputs = []
+            for h, anchor in zip(hs, anchors):
+                offset = self.box_embed(h)
+                pred_box = (inverse_sigmoid(anchor) + offset).sigmoid()
+                outputs.append({
+                    'pred_logits': self.cls_embed(h),
+                    'pred_boxes': pred_box
+                })
+
+            outputs = split_outputs(outputs, targets, self.num_group)
+            outputs['noised_targets'] = noised_query['targets']
+            outputs['noised_indices'] = noised_query['indices']
+            
+        else:
+            outputs = {
+                'pred_logits': self.cls_embed(hs[-1]),
+                'pred_boxes': (inverse_sigmoid(anchors[-1]) + self.box_embed(hs[-1])).sigmoid()
+            }
+
+        return outputs
