@@ -38,7 +38,7 @@ def generate_noised_neg_boxes(existing_boxes,
     return torch.tensor(result[:num_boxes])
 
 
-def make_cdn_query(targets: list = None,
+def make_dn_query(targets: list = None,
                    num_group: int = 5,
                    label_enc: torch.nn.Embedding = None,
                    num_class: int = 2,

@@ -4,6 +4,18 @@ import torch
 from torchvision.ops import box_iou
 from utils.box_ops import box_cxcywh_to_xyxy
 
+def get_atss(atss_mode, atss_k):
+    atss = None
+    if atss_mode == 'atss':
+        atss = ATSS(atss_k, 'mean+std')
+
+    elif atss_mode == 'atss_mean':
+        atss = ATSS(atss_k, 'mean')
+
+    elif atss_mode == 'matss':
+        atss =  ModifiedATSS(atss_k, atss_k//2)
+    return atss
+
 class ATSS(torch.nn.Module):
     def __init__(self, k, threshold='mean+std'):
         super().__init__()

@@ -91,7 +91,6 @@ class Co_DETR(nn.Module):
             self.anchor_query = nn.Embedding(n_query, 4)
             
         # label embedding
-        # 0: cls0, 1: cls1, 2: back, 3: learnable
         self.label_enc = nn.Embedding(self.num_class + 1, d_model - 1)
 
         # head
@@ -134,11 +133,7 @@ class Co_DETR(nn.Module):
                 self.anchor_query.weight.data[:, :2].requires_grad = False
 
     def forward(self, img, mask, targets=None):
-        """Forward.
-
-        img: B, C, H, W
-        mask: B, H, W
-        """
+        """Forward."""
         # feature extraction
         feature = self.backbone(img)
         mask = F.interpolate(mask.unsqueeze(1), feature.shape[2:], mode='nearest')
@@ -164,7 +159,7 @@ class Co_DETR(nn.Module):
                                           add_neg_query=self.add_neg_query,
                                           device=img.device)
         
-        hs, anchors, enc_ref, memory, atss_src = self.transformer(img_feature=image_feature,
+        hs, anchors, enc_ref, memory, aux_indices = self.transformer(img_feature=image_feature,
                                                         img_pos_embed=pos_embed,
                                                         img_mask=mask,
                                                         anchor_query=self.anchor_query,
@@ -190,14 +185,22 @@ class Co_DETR(nn.Module):
                 })
 
             # Split matching part and denosing part
-            num_dn_query = self.num_dn_query * self.num_group
-            if self.add_neg_query:
-                num_dn_query *= 2
-            outputs = split_outputs(outputs, num_dn_query) # split matching part and denoising part
+            num_noised_query = self.num_dn_query * self.num_group * (2 if self.add_neg_query else 1)
+            if self.anchor_query is not None:
+                num_model_query = self.anchor_query.weight.shape[0]
+            else:
+                num_model_query = min(self.transformer.num_encoder_query, memory.shape[1])
+            num_aux_query = memory.shape[1]
+            split_sizes = [num_noised_query, num_model_query, num_aux_query]
+            split_labels = ['cdn', 'model', 'aux']
+            outputs = split_outputs(outputs, split_sizes, split_labels) # split matching part and denoising part
+            
+            # add taragets for training
             outputs['cdn_targets'] = noised_query['targets']
             outputs['cdn_indices'] = noised_query['indices']
             outputs['first_stage'] = first_stage
-            outputs['atss_results'] = atss_src
+            outputs['aux_indices'] = aux_indices
+            
         else:
             outputs = {
                 'pred_logits': self.cls_embed(hs[-1]),

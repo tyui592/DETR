@@ -11,7 +11,7 @@ from .backbone import get_backbone
 from .position_encoding import get_pos_embedding
 from .transformer import get_transformer
 from .layers import MLP
-from .dn_func import make_cdn_query, split_outputs
+from .dn_func import make_dn_query, split_outputs
 
 
 def get_dn_detr(args, device):
@@ -118,7 +118,7 @@ class DN_DETR(nn.Module):
 
         noised_query = None
         if self.training:
-            noised_query = make_cdn_query(targets=targets,
+            noised_query = make_dn_query(targets=targets,
                                           num_group=self.num_group, 
                                           label_enc=self.label_enc,
                                           num_class=self.num_class,

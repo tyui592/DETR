@@ -162,22 +162,14 @@ def make_cdn_query(targets: list = None,
         }
     return cdn
 
-def split_outputs(outputs, num_dn_query):
+def split_outputs(outputs, sizes, labels):
     parts = defaultdict(list)
     for output in outputs:
-        pred_logits = output['pred_logits']
-        pred_boxes = output['pred_boxes']
-        n = pred_logits.shape[1]
-        sizes = [num_dn_query, n-num_dn_query]
-        cdn_logits, model_logits = pred_logits.split(sizes, dim=1)
-        cdn_boxes, model_boxes = pred_boxes.split(sizes, dim=1)
-        parts['cdn'].append({
-            'pred_logits': cdn_logits,
-            'pred_boxes': cdn_boxes,
-        })
-        parts['model'].append({
-            'pred_logits': model_logits,
-            'pred_boxes': model_boxes,
-        })
-
+        pred_logits_lst = output['pred_logits'].split(sizes, dim=1)
+        pred_boxes_lst = output['pred_boxes'].split(sizes, dim=1)
+        for label, pred_logits, pred_boxes in zip(labels, pred_logits_lst, pred_boxes_lst):
+            parts[label].append({
+                'pred_logits': pred_logits,
+                'pred_boxes': pred_boxes
+            })
     return parts

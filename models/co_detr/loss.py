@@ -158,16 +158,10 @@ class Criterion(nn.Module):
         return total_loss
     
     def forward(self, outputs: dict, targets: list):
-        """Forward function.
-
-        output['model']: decoder's output with learnable(model) queries
-        output['denosing']: decoder's output with noised queries
-        output['encoder']: decoder's output with encoder queries(two-stage)
-        output['enc_outputs']: encoder's output with encoder features
-        """
+        """Forward function."""
         # loss calculation per parts
         losses = defaultdict(list)
-        for key in ['model', 'cdn']:
+        for key in ['model', 'cdn', 'first_stage']:
             _outputs = outputs[key]
             if not self.aux_flag:
                 _outputs = _outputs[-1:]
@@ -189,38 +183,22 @@ class Criterion(nn.Module):
                 if key == 'model' and self.cls_loss == 'ce':
                     cardinality = self.calc_cardinality(output, _targets)
                     self.summary['cardinality'].update(cardinality)
-                    
-        # first-stage outputs
-        for output in outputs['first_stage']:
-            indices = self.matcher(output, targets)
-
-            l1_loss, giou_loss = self.calc_box_loss(output, targets, indices)
-            cls_loss = self.calc_cls_loss(output, targets, indices)
-            
-            losses['first_l1_loss'].append(l1_loss)
-            losses['first_giou_loss'].append(giou_loss)
-            losses['first_cls_loss'].append(cls_loss)
 
         # use auxiliary collaborative heads
-        if 'atss_results' in outputs:
-            # image-wise for loop
-            atss_results = outputs['atss_results']
-            for i, _outputs in enumerate(atss_results['outputs']):
-                pred_logits = _outputs['pred_logits']
-                pred_boxes = _outputs['pred_boxes']
-                num_dec_layer = pred_logits.shape[0]
-                _output = {'pred_logits': pred_logits, 'pred_boxes': pred_boxes}
-                _target = [atss_results['targets'][i]] * num_dec_layer
-                _indices = [atss_results['indices'][i]] * num_dec_layer
-                
-                l1_loss, giou_loss = self.calc_box_loss(_output, _target, _indices)
-                cls_loss = self.calc_cls_loss(_output, _target, _indices)
-               
-                losses['atss_l1_loss'].append(l1_loss)
-                losses['atss_giou_loss'].append(giou_loss)
-                losses['fatss_cls_loss'].append(cls_loss)
-                    
+        for key in ['aux']:
+            _outputs = outputs[key]
+            if not self.aux_flag:
+                _outputs = _outputs[-1:]
+            for output in _outputs:
+                for aux_key, indices in outputs['aux_indices'].items():
+                    l1_loss, giou_loss = self.calc_box_loss(output, targets, indices)
+                    cls_loss = self.calc_cls_loss(output, targets, indices)
 
+                    losses[f'{aux_key}_l1_loss'].append(l1_loss)
+                    losses[f'{aux_key}_giou_loss'].append(giou_loss)
+                    losses[f'{aux_key}_cls_loss'].append(cls_loss)
+
+        # calcaulte total loss
         total_loss = self.calc_total_loss(losses)
 
         return total_loss

@@ -323,7 +323,7 @@ def build_parser():
     # misc
     parser.add_argument('--save_root',
                         type=Path,
-                        default='./model-store/ex01/')
+                        default='./model-store/DETR/')
 
     parser.add_argument('--topk',
                         type=int,

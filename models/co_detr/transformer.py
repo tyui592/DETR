@@ -8,7 +8,7 @@ from typing import Optional
 from collections import defaultdict
 from utils.misc import inverse_sigmoid
 from .layers import MHA, FeedForward, MLP
-from .atss import ATSS, ModifiedATSS
+from .atss import get_atss
 
 def get_transformer(args):
     """Get a transformer model with the arguments."""
@@ -55,7 +55,7 @@ class Transformer(nn.Module):
                  decoder_temperature: int = 10000,
                  two_stage_mode: str = 'static',
                  num_encoder_query: int = 100,
-                 atss_mode: str = 'none',
+                 atss_mode: str = 'atss_mean',
                  atss_k: int = 9,
                  ):
         """Initiailze."""
@@ -82,14 +82,7 @@ class Transformer(nn.Module):
                                temperature=decoder_temperature,
                                modulate_wh_attn=modulate_wh_attn)
         
-        if atss_mode == 'atss':
-            self.atss = ATSS(atss_k, 'mean+std')
-
-        elif atss_mode == 'atss_mean':
-            self.atss = ATSS(atss_k, 'mean')
-
-        elif atss_mode == 'matss':
-            self.atss = ModifiedATSS(atss_k, atss_k//2)
+        self.atss = get_atss(atss_mode, atss_k)
 
         self.two_stage_mode = two_stage_mode
         if self.two_stage_mode in ['pure', 'mix']:
@@ -149,18 +142,21 @@ class Transformer(nn.Module):
             boxes = (reference + self.enc_box_embed(memory)).sigmoid()
 
             # get topk(by logit) samples(boxs, labels) from the encoder output
-            enc_output = self.get_topk_query(boxes, logits, img_mask, self.num_encoder_query)
+            enc_topk_output = self.get_topk_query(boxes, logits, img_mask, self.num_encoder_query)
 
+            aux_query = None
+            aux_indices = None
             if hasattr(self, 'atss') and self.training:
-                atss_queries, atss_targets, atss_indices = self.make_atss_query_target(boxes, logits, targets, label_enc, memory.device)
+                aux_query, aux_indices = self.make_aux_query(boxes, logits, targets, label_enc, memory.device)
                 
         # make query for decoder (merge multiple queries for efficiency)
         label_query, anchor_query, dec_sa_mask = self.make_object_query(bs=memory.shape[0],
                                                                         mode=self.two_stage_mode, 
-                                                                        encoder_output=enc_output,
+                                                                        encoder_output=enc_topk_output,
                                                                         label_enc=label_enc,
                                                                         anchor_query=anchor_query,
                                                                         noised_query=noised_query,
+                                                                        aux_query=aux_query,
                                                                         device=memory.device)
                 
         # decoder
@@ -170,57 +166,23 @@ class Transformer(nn.Module):
                                    anchor_query=anchor_query,
                                    mask=img_mask,
                                    attn_mask=dec_sa_mask)
-        
-        atss_src = None
-        if hasattr(self, 'atss') and self.training:
-            atss_src = defaultdict(list)
-
-            # image-wise for loop (Because the num. of obj. in each image is different)
-            for i, atss_query in enumerate(atss_queries):
-                if atss_query['label_query'].shape[0] != 0:
-                    _hs, _anchors = self.decoder(x=atss_query['label_query'].unsqueeze(0),
-                                                        memory=memory[i].unsqueeze(0),
-                                                        pos_embed=img_pos_embed[i].unsqueeze(0),
-                                                        anchor_query=atss_query['anchor_query'].unsqueeze(0),
-                                                        mask=img_mask[i].unsqueeze(0),
-                                                        attn_mask=None)
-                    atss_hs = torch.cat(_hs)
-                    atss_ref = torch.cat(_anchors)
-                    atss_src['outputs'].append({'pred_logits': self.enc_cls_embed(atss_hs),
-                                                'pred_boxes': (inverse_sigmoid(atss_ref) + self.enc_box_embed(atss_hs)).sigmoid()})
-                    atss_src['targets'].append(atss_targets[i])
-                    atss_src['indices'].append(atss_indices[i])
                 
-        return hs, anchors, reference, memory, atss_src
+        return hs, anchors, reference, memory, aux_indices
     
-    def make_atss_query_target(self, boxes, logits, targets, label_enc, device):
-        atss_queries = []
-        atss_targets = []
-        atss_indices = []
-        indices = self.atss({'pred_boxes': boxes, 'pred_logits': logits}, targets)
-        for b, (i, j) in enumerate(indices):
-            atss_labels = logits[b][i].argmax(dim=-1)
-            atss_label_embedding = label_enc(atss_labels)
-            indicator = torch.tensor([1], dtype=atss_label_embedding.dtype, device=device)
-            atss_label_query = torch.cat([atss_label_embedding, indicator[None, ...].repeat(len(atss_labels), 1)], dim=-1)
+    def make_aux_query(self, boxes, logits, targets, label_enc, device):
+        # make index for loss calculation
+        atss_indices = self.atss({'pred_boxes': boxes, 'pred_logits': logits}, targets)
 
-            atss_anchor_query = inverse_sigmoid(boxes[b][i])
+        labels = logits.argmax(dim=-1)
+        bs, nq = labels.shape
+        label_embeddings = label_enc(labels)
+        indicator1 = torch.ones([1, 1, 1], dtype=label_embeddings.dtype, device=device)
+        label_query = torch.cat([label_embeddings, indicator1.repeat(bs, nq, 1)], dim=-1)
+        anchor_query = inverse_sigmoid(boxes)
 
-            atss_queries.append({'label_query': atss_label_query, 'anchor_query': atss_anchor_query})
-
-            tgt_boxes = targets[b]['boxes'][j]
-            tgt_labels = targets[b]['labels'][j]
-
-            index = torch.arange(len(i), dtype=torch.long, device=device)
-            atss_targets.append({'boxes': tgt_boxes.to(device), 'labels': tgt_labels.to(device)})
-            atss_indices.append((index, index))
-        return atss_queries, atss_targets, atss_indices
-    
-    def _get_src_permutation_idx(self, indices):
-        # permute predictions following indices
-        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
-        src_idx = torch.cat([src for (src, _) in indices])
-        return batch_idx, src_idx
+        aux_query = {'label_query': label_query, 'anchor_query': anchor_query}
+        aux_indices = {'atss': atss_indices}
+        return aux_query, aux_indices
     
     def get_encoder_reference(self, mask, shapes):
         N, _, H, W = shapes
@@ -257,7 +219,7 @@ class Transformer(nn.Module):
         mask: image padding mask
         topk: for encoder query
         """
-        logits.masked_fill_(mask.squeeze().unsqueeze(-1) == 0, float('-inf'))
+        logits = logits.masked_fill(mask.squeeze().unsqueeze(-1) == 0, float('-inf'))
         max_logits, max_labels = torch.max(logits, dim=2)
         topk_indices = torch.topk(max_logits, k=topk, dim=1)[1]
         
@@ -272,6 +234,7 @@ class Transformer(nn.Module):
                           encoder_output: Optional[dict],
                           label_enc: torch.nn.Embedding,
                           anchor_query: Optional[torch.nn.Embedding],
+                          aux_query: Optional[dict],
                           noised_query: dict,
                           device: torch.device):
         """Make decoder input query and attn. mask
@@ -319,31 +282,41 @@ class Transformer(nn.Module):
             
         # merge cdn query and model query
         if self.training:
+            _label_query = []
+            _anchor_query = []
+            _attn_mask = []
+
             noised_label_query = noised_query['label_query']
             noised_anchor_query = noised_query['anchor_query']
             noised_attn_mask = noised_query['attn_mask']
-            num_noised_query = noised_label_query.shape[1]
-            
-            if mode == 'static':
-                label_query = torch.cat([noised_label_query,
-                                         model_label_query], dim=1)
-                anchor_query = torch.cat([noised_anchor_query,
-                                          model_anchor_query], dim=1)
-                n = label_query.shape[1]
-                attn_mask = torch.zeros((n, n), device=device)
-                attn_mask[:num_noised_query, :num_noised_query] = noised_attn_mask
-                attn_mask[:, num_noised_query:] = 1
-                
+
+            _label_query.append(noised_label_query)
+            _anchor_query.append(noised_anchor_query)
+            _attn_mask.append(noised_attn_mask)
+       
+            if mode in ['none', 'static']:
+                k = model_label_query.shape[1]
+                _label_query.append(model_label_query)
+                _anchor_query.append(model_anchor_query)
+                _attn_mask.append(torch.ones((k, k), device=device))
+
             elif mode in ['pure', 'mix']:
-                label_query = torch.cat([noised_label_query,
-                                         enc_label_query], dim=1)
-                anchor_query = torch.cat([noised_anchor_query,
-                                          enc_anchor_query], dim=1)
-                n = label_query.shape[1]
-                attn_mask = torch.zeros((n, n), device=device)
-                attn_mask[:num_noised_query, :num_noised_query] = noised_attn_mask
-                attn_mask[num_noised_query:, num_noised_query:] = 1
+                k = enc_label_query.shape[1]
+                _label_query.append(enc_label_query)
+                _anchor_query.append(enc_anchor_query)
+                _attn_mask.append(torch.ones((k, k), device=device))
             
+            if aux_query is not None:
+                aux_label_query = aux_query['label_query']
+                aux_anchor_query = aux_query['anchor_query']
+                k = aux_label_query.shape[1]
+                _label_query.append(aux_label_query)
+                _anchor_query.append(aux_anchor_query)
+                _attn_mask.append(torch.ones((k, k), device=device))
+
+            label_query = torch.cat(_label_query, dim=1)
+            anchor_query = torch.cat(_anchor_query, dim=1)
+            attn_mask = torch.block_diag(*_attn_mask)
         else:
             attn_mask = None
             if mode in ['none', 'static']:
