@@ -164,13 +164,14 @@ class Co_DETR(nn.Module):
                                           add_neg_query=self.add_neg_query,
                                           device=img.device)
         
-        hs, anchors, enc_ref, memory = self.transformer(img_feature=image_feature,
+        hs, anchors, enc_ref, memory, atss_src = self.transformer(img_feature=image_feature,
                                                         img_pos_embed=pos_embed,
                                                         img_mask=mask,
                                                         anchor_query=self.anchor_query,
                                                         feature_shape=feature.shape,
                                                         noised_query=noised_query,
-                                                        label_enc=self.label_enc)
+                                                        label_enc=self.label_enc,
+                                                        targets=targets)
         
         if self.training:
             outputs = []
@@ -192,10 +193,11 @@ class Co_DETR(nn.Module):
             num_dn_query = self.num_dn_query * self.num_group
             if self.add_neg_query:
                 num_dn_query *= 2
-            outputs = split_outputs(outputs, num_dn_query)
+            outputs = split_outputs(outputs, num_dn_query) # split matching part and denoising part
             outputs['cdn_targets'] = noised_query['targets']
             outputs['cdn_indices'] = noised_query['indices']
             outputs['first_stage'] = first_stage
+            outputs['atss_results'] = atss_src
         else:
             outputs = {
                 'pred_logits': self.cls_embed(hs[-1]),

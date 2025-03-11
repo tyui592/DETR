@@ -7,7 +7,6 @@ from collections import defaultdict
 from models.matcher import HungarianMatcher
 from utils.box_ops import generalized_box_iou, box_cxcywh_to_xyxy
 from utils.misc import AverageMeter
-from models.atss import ATSS, ModifiedATSS
 
 
 def get_co_detr_criterion(args, device):
@@ -28,9 +27,7 @@ def get_co_detr_criterion(args, device):
                           giou_weight=args.giou_loss_weight,
                           cls_weight=args.cls_loss_weight,
                           focal_gamma=args.focal_gamma,
-                          focal_alpha=args.focal_alpha,
-                          atss_mode=args.atss_mode,
-                          atss_k=args.atss_k).to(device)
+                          focal_alpha=args.focal_alpha).to(device)
 
     return criterion
 
@@ -48,13 +45,8 @@ class Criterion(nn.Module):
                  giou_weight: float = 1.0,
                  cls_weight: float = 1.0,
                  focal_gamma: float = 2.0,
-                 focal_alpha: float = 0.25,
-                 atss_mode: str = None,
-                 atss_k: int = 20):
-        """Initialize.
-
-        atss_mode: 'none', 'atss', 'matss'
-        """
+                 focal_alpha: float = 0.25):
+        """Initialize."""
         super().__init__()
         self.matcher = matcher
         self.n_cls = n_cls
@@ -63,15 +55,6 @@ class Criterion(nn.Module):
         self.loss_weights = {'l1': l1_weight,
                              'giou': giou_weight,
                              'cls': cls_weight}
-
-        if atss_mode == 'atss':
-            self.atss = ATSS(atss_k, 'mean+std')
-
-        elif atss_mode == 'atss_mean':
-            self.atss = ATSS(atss_k, 'mean')
-
-        elif atss_mode == 'matss':
-            self.atss = ModifiedATSS(atss_k, n=atss_k//2)
 
         if self.cls_loss == 'ce':
             # class weights
@@ -209,16 +192,34 @@ class Criterion(nn.Module):
                     
         # first-stage outputs
         for output in outputs['first_stage']:
-            if hasattr(self, 'atss'):
-                indices = self.atss(output, targets)
-            else:
-                indices = self.matcher(output, targets)
+            indices = self.matcher(output, targets)
 
             l1_loss, giou_loss = self.calc_box_loss(output, targets, indices)
             cls_loss = self.calc_cls_loss(output, targets, indices)
+            
             losses['first_l1_loss'].append(l1_loss)
             losses['first_giou_loss'].append(giou_loss)
             losses['first_cls_loss'].append(cls_loss)
+
+        # use auxiliary collaborative heads
+        if 'atss_results' in outputs:
+            # image-wise for loop
+            atss_results = outputs['atss_results']
+            for i, _outputs in enumerate(atss_results['outputs']):
+                pred_logits = _outputs['pred_logits']
+                pred_boxes = _outputs['pred_boxes']
+                num_dec_layer = pred_logits.shape[0]
+                _output = {'pred_logits': pred_logits, 'pred_boxes': pred_boxes}
+                _target = [atss_results['targets'][i]] * num_dec_layer
+                _indices = [atss_results['indices'][i]] * num_dec_layer
+                
+                l1_loss, giou_loss = self.calc_box_loss(_output, _target, _indices)
+                cls_loss = self.calc_cls_loss(_output, _target, _indices)
+               
+                losses['atss_l1_loss'].append(l1_loss)
+                losses['atss_giou_loss'].append(giou_loss)
+                losses['fatss_cls_loss'].append(cls_loss)
+                    
 
         total_loss = self.calc_total_loss(losses)
 

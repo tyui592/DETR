@@ -4,10 +4,11 @@
 import math
 import torch
 import torch.nn as nn
-
+from typing import Optional
+from collections import defaultdict
 from utils.misc import inverse_sigmoid
 from .layers import MHA, FeedForward, MLP
-from typing import Optional
+from .atss import ATSS, ModifiedATSS
 
 def get_transformer(args):
     """Get a transformer model with the arguments."""
@@ -27,7 +28,9 @@ def get_transformer(args):
                               modulate_wh_attn=args.modulate_wh_attn,
                               decoder_temperature=args.temperature,
                               two_stage_mode=args.two_stage_mode,
-                              num_encoder_query=args.num_encoder_query)
+                              num_encoder_query=args.num_encoder_query,
+                              atss_mode=args.atss_mode,
+                              atss_k=args.atss_k)
     return transformer
 
 
@@ -51,7 +54,10 @@ class Transformer(nn.Module):
                  modulate_wh_attn: bool = True,
                  decoder_temperature: int = 10000,
                  two_stage_mode: str = 'static',
-                 num_encoder_query: int = 100):
+                 num_encoder_query: int = 100,
+                 atss_mode: str = 'none',
+                 atss_k: int = 9,
+                 ):
         """Initiailze."""
         super().__init__()
 
@@ -76,6 +82,15 @@ class Transformer(nn.Module):
                                temperature=decoder_temperature,
                                modulate_wh_attn=modulate_wh_attn)
         
+        if atss_mode == 'atss':
+            self.atss = ATSS(atss_k, 'mean+std')
+
+        elif atss_mode == 'atss_mean':
+            self.atss = ATSS(atss_k, 'mean')
+
+        elif atss_mode == 'matss':
+            self.atss = ModifiedATSS(atss_k, atss_k//2)
+
         self.two_stage_mode = two_stage_mode
         if self.two_stage_mode in ['pure', 'mix']:
             self.enc_box_embed = None
@@ -83,6 +98,7 @@ class Transformer(nn.Module):
             self.num_encoder_query = num_encoder_query
             self.enc_out_layer = nn.Linear(d_model, d_model)
             self.enc_out_norm = nn.LayerNorm(d_model)
+            
         self._reset_parameters()
         # Pattern embedding for multiple object detections on a location.
         if num_pattern > 0:
@@ -101,7 +117,8 @@ class Transformer(nn.Module):
                 anchor_query: Optional[torch.nn.Embedding],
                 noised_query: Optional[dict],
                 feature_shape: list,
-                label_enc: torch.nn.Embedding):
+                label_enc: torch.nn.Embedding,
+                targets: list):
         """Transformer Forward.
 
         image feautre: image feuatre (batch size x HW x d_model)
@@ -121,7 +138,7 @@ class Transformer(nn.Module):
         # two stage
         enc_output = None
         reference = None
-        if self.two_stage_mode in ['pure', 'mix']:
+        if self.two_stage_mode in ['pure', 'mix'] or hasattr(self, 'atss'):
             memory = self.enc_out_norm(self.enc_out_layer(memory))
             
             # get referecne with mask and feature map shape
@@ -134,6 +151,9 @@ class Transformer(nn.Module):
             # get topk(by logit) samples(boxs, labels) from the encoder output
             enc_output = self.get_topk_query(boxes, logits, img_mask, self.num_encoder_query)
 
+            if hasattr(self, 'atss') and self.training:
+                atss_queries, atss_targets, atss_indices = self.make_atss_query_target(boxes, logits, targets, label_enc, memory.device)
+                
         # make query for decoder (merge multiple queries for efficiency)
         label_query, anchor_query, dec_sa_mask = self.make_object_query(bs=memory.shape[0],
                                                                         mode=self.two_stage_mode, 
@@ -150,8 +170,57 @@ class Transformer(nn.Module):
                                    anchor_query=anchor_query,
                                    mask=img_mask,
                                    attn_mask=dec_sa_mask)
+        
+        atss_src = None
+        if hasattr(self, 'atss') and self.training:
+            atss_src = defaultdict(list)
 
-        return hs, anchors, reference, memory
+            # image-wise for loop (Because the num. of obj. in each image is different)
+            for i, atss_query in enumerate(atss_queries):
+                if atss_query['label_query'].shape[0] != 0:
+                    _hs, _anchors = self.decoder(x=atss_query['label_query'].unsqueeze(0),
+                                                        memory=memory[i].unsqueeze(0),
+                                                        pos_embed=img_pos_embed[i].unsqueeze(0),
+                                                        anchor_query=atss_query['anchor_query'].unsqueeze(0),
+                                                        mask=img_mask[i].unsqueeze(0),
+                                                        attn_mask=None)
+                    atss_hs = torch.cat(_hs)
+                    atss_ref = torch.cat(_anchors)
+                    atss_src['outputs'].append({'pred_logits': self.enc_cls_embed(atss_hs),
+                                                'pred_boxes': (inverse_sigmoid(atss_ref) + self.enc_box_embed(atss_hs)).sigmoid()})
+                    atss_src['targets'].append(atss_targets[i])
+                    atss_src['indices'].append(atss_indices[i])
+                
+        return hs, anchors, reference, memory, atss_src
+    
+    def make_atss_query_target(self, boxes, logits, targets, label_enc, device):
+        atss_queries = []
+        atss_targets = []
+        atss_indices = []
+        indices = self.atss({'pred_boxes': boxes, 'pred_logits': logits}, targets)
+        for b, (i, j) in enumerate(indices):
+            atss_labels = logits[b][i].argmax(dim=-1)
+            atss_label_embedding = label_enc(atss_labels)
+            indicator = torch.tensor([1], dtype=atss_label_embedding.dtype, device=device)
+            atss_label_query = torch.cat([atss_label_embedding, indicator[None, ...].repeat(len(atss_labels), 1)], dim=-1)
+
+            atss_anchor_query = inverse_sigmoid(boxes[b][i])
+
+            atss_queries.append({'label_query': atss_label_query, 'anchor_query': atss_anchor_query})
+
+            tgt_boxes = targets[b]['boxes'][j]
+            tgt_labels = targets[b]['labels'][j]
+
+            index = torch.arange(len(i), dtype=torch.long, device=device)
+            atss_targets.append({'boxes': tgt_boxes.to(device), 'labels': tgt_labels.to(device)})
+            atss_indices.append((index, index))
+        return atss_queries, atss_targets, atss_indices
+    
+    def _get_src_permutation_idx(self, indices):
+        # permute predictions following indices
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx = torch.cat([src for (src, _) in indices])
+        return batch_idx, src_idx
     
     def get_encoder_reference(self, mask, shapes):
         N, _, H, W = shapes
