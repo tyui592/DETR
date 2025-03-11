@@ -16,8 +16,9 @@ NOTE: The average number of objects per image in this dataset is 16, which is hi
 
 ## Models (Currently supported features)
 - DETR
+  - [X] Auxiliary losses from decoder layers
 - Conditional DETR
-  - [X] Concatenate content and position embeddings in the cross-attention
+  - [X] Concatenate content and positional embeddings in the cross-attention
 - DAB DETR
   - [X] Anchor query
   - [X] Modulate positional attention
@@ -27,134 +28,86 @@ NOTE: The average number of objects per image in this dataset is 16, which is hi
 - DNIO DETR
   - [X] A fixed number of noised queries
   - [X] Noised negative queries
-  - [ ] Mixed query selection (two-stage)
+  - [x] Mixed query selection
   - [ ] Look forward twice  
 - Co DETR
-  - [x] Two-stage Detection
-  - [x] Train encoder with ATSS 
-  - [ ] Multiple Auxiliary Heads
+  - [ ] Auxiliary collaborative heads
+      - [x] ATSS
+      - [ ] Faster-RCNN
+      - [ ] PAA
+  - [ ] Multi-scale adapter
 
 ### Experimental Results
 * Model performance (mAP)
 ![performance](./assets/performance.png)
 
-* Sample Results
-
-| Model | Output#1(w/ threshold 0.5, w/o nms)| Output#2(w/ threshold 0.5, w/o nms)| Output#2(w/ threshold 0.3, w/ nms 0.3)|
-| --- | --- | -- | -- |
-| GT | ![gt](./assets/ground_truth.png) | ![gt2](./assets/ground_truth2.png) | ![gt2](./assets/ground_truth2.png) | 
-| DETR | ![detr](./assets/DETR_000366.png) | ![detr2](./assets/DETR_001130.png) |  ![detr3](./assets/DETR_001130_nms.png) | 
-| Conditional DETR | ![cond](./assets/Conditional_DETR_000366.png) | ![cond2](./assets/Conditional_DETR_001130.png) | ![cond3](./assets/Conditional_DETR_001130_nms.png) | 
-| DAB-DETR | ![dab](./assets/DAB-DETR_000366.png) | ![dab2](./assets/DAB-DETR_001130.png) | ![dab3](./assets/DAB-DETR_001130_nms.png) | 
-| DN-DETR | ![dn](./assets/DN-DETR_000366.png) | ![dn2](./assets/DN-DETR_001130.png) | ![dn3](./assets/DN-DETR_001130_nms.png) | 
-| DINO-DETR | ![dino](./assets/DINO-DETR_000366.png) | ![dino2](./assets/DINO-DETR_001130.png) | ![dino3](./assets/DINO-DETR_001130_nms.png) |
-
 ## Usage
 - Check the [requirements.txt](./requirements.txt).
 
 ## Scripts
-<details>
-  <summary>Model train/validation scripts</summary>
-
 ```bash
 # DETR
-ex=01
-python main.py --mode 'train' --device "cuda:0" --model 'detr' --dataset 'shwd' \
-  --lr 0.00005 --lr_backbone 0.00001 --epochs 700 --lr_milestone 600 --lr_gamma 0.1 \
-  --return_intermediate --max_grad_norm 0.1 --weight_decay 0.0001 \
-  --d_model 256 --d_ff 2048 --n_heads 8 --p_drop 0.0 --n_query 600 \
-  --backbone "resnet50" --layer_index 7 --n_decoder_layers 6 --n_encoder_layers 6 \
-  --encoder_position_mode 'add' --decoder_sa_position_mode 'add' --decoder_ca_position_mode 'add' \
-  --batch_size 8 --image_set 'trainval' --aug_policy 6 \
-  --num_workers 4 --pin_memory --save_root "model-store/ex${ex}" \
-  --cls_loss 'ce' --pos_embedding 'sine' --temperature 10000 \
-  --cls_match_weight 1.0 --l1_match_weight 5.0 --giou_match_weight 2.0 \
-  --cls_loss_weight 1.0 --l1_loss_weight 5.0 --giou_loss_weight 2.0 --noobj_cls_weight 0.1 \
-  --wb_flag --wb_project 'detr' --wb_name "${ex}" --wb_tags "DETR"
+gpu=0
+ex='DETR'
+python main.py --mode 'train' --device "cuda:${gpu}" --model 'detr' \
+  --lr 0.00005 --epochs 500 --lr_milestone 400 --return_intermediate \
+  --n_query 600 --decoder_ca_position_mode 'add' \
+  --pin_memory --save_root "model-store/${ex}" \
+  --pos_embedding 'sine' --temperature 10000 \
+  --cls_match_weight 1.0 --cls_loss_weight 1.0
 
 # Conditional DETR
-ex=02
-python main.py --mode 'train' --device "cuda:0" --model 'conditional_detr' --dataset 'shwd' \
-  --lr 0.0001 --lr_backbone 0.00001 --epochs 50 --lr_milestone 40 --lr_gamma 0.1 \
-  --return_intermediate --max_grad_norm 0.1 --weight_decay 0.0001 \
-  --d_model 256 --d_ff 2048 --n_heads 8 --p_drop 0.0 --n_query 600 --num_pattern 0 \
-  --backbone "resnet50" --layer_index 7 --n_decoder_layers 6 --n_encoder_layers 6 \
-  --encoder_position_mode 'add' --decoder_sa_position_mode 'add' --decoder_ca_position_mode 'cat' \
-  --batch_size 8 --image_set 'trainval' --aug_policy 6 \
-  --num_workers 4 --pin_memory --save_root "model-store/ex${ex}" \
-  --cls_loss 'focal' --pos_embedding 'sinev2' --temperature 20 --query_scale_mode 'diag' \
-  --transformer_activation 'relu' \
-  --cls_match_weight 2.0 --l1_match_weight 5.0 --giou_match_weight 2.0 \
-  --cls_loss_weight 2.0 --l1_loss_weight 5.0 --giou_loss_weight 2.0 --noobj_cls_weight 0.1 \
-  --wb_flag --wb_project 'detr' --wb_name "${ex}" --wb_tags "Conditional-DETR"
+ex='C_DETR'
+python main.py --mode 'train' --device "cuda:${gpu}" --model 'conditional_detr' \
+  --epochs 50 --lr_milestone 40 --return_intermediate --n_query 600 \
+  --pin_memory --save_root "model-store/${ex}" \
+  --cls_loss 'focal' --pos_embedding 'sinev2' \
+  --temperature 20 --query_scale_mode 'diag' 
 
 # DAB DETR
-ex=03
-python main.py --mode 'train' --device "cuda:0" --model 'dab-detr' --dataset 'shwd' \
-  --lr 0.0001 --lr_backbone 0.00001 --epochs 50 --lr_milestone 40 --lr_gamma 0.1 \
-  --return_intermediate --max_grad_norm 0.1 --weight_decay 0.0001 \
-  --d_model 256 --d_ff 2048 --n_heads 8 --p_drop 0.0 --n_query 200 --num_pattern 3 \
-  --backbone "resnet50" --layer_index 7 --n_decoder_layers 6 --n_encoder_layers 6 \
-  --encoder_position_mode 'add' --decoder_sa_position_mode 'add' --decoder_ca_position_mode 'cat' \
-  --batch_size 8 --image_set 'trainval' --aug_policy 6 \
-  --num_workers 4 --pin_memory --save_root "model-store/ex${ex}" \
-  --cls_loss 'focal' --pos_embedding 'sinev2' --temperature 20 --query_scale_mode 'diag' \
-  --modulate_wh_attn --iter_update --transformer_activation 'prelu' \
-  --cls_match_weight 2.0 --l1_match_weight 5.0 --giou_match_weight 2.0 \
-  --cls_loss_weight 2.0 --l1_loss_weight 5.0 --giou_loss_weight 2.0 --noobj_cls_weight 0.1 \
-  --wb_flag --wb_project 'detr' --wb_name "${ex}" --wb_tags "DAB-DETR"
+ex='DAB-DETR'
+python main.py --mode 'train' --device "cuda:${gpu}" --model 'dab-detr' \
+  --epochs 50 --lr_milestone 40 --return_intermediate \
+  --n_query 200 --num_pattern 3 \
+  --pin_memory --save_root "model-store/${ex}" \
+  --cls_loss 'focal' --pos_embedding 'sinev2' --temperature 20 \
+  --modulate_wh_attn --iter_update --transformer_activation 'prelu'
 
 # DN DETR
-ex=04
-python main.py --mode 'train' --device "cuda:0" --model 'dn-detr' --dataset 'shwd' \
-  --lr 0.0001 --lr_backbone 0.00001 --epochs 50 --lr_milestone 40 --lr_gamma 0.1 \
-  --return_intermediate --max_grad_norm 0.1 --weight_decay 0.0001 \
-  --d_model 256 --d_ff 2048 --n_heads 8 --p_drop 0.0 --n_query 600 \
-  --backbone "resnet50" --layer_index 7 --n_decoder_layers 6 --n_encoder_layers 6 \
-  --encoder_position_mode 'add' --decoder_sa_position_mode 'add' --decoder_ca_position_mode 'cat' \
-  --batch_size 8 --image_set 'trainval' --aug_policy 6 \
-  --num_workers 4 --pin_memory --save_root "model-store/ex${ex}" \
-  --cls_loss 'focal' --pos_embedding 'sinev2' --temperature 20 --query_scale_mode 'diag' \
+ex='DN-DETR'
+python main.py --mode 'train' --device "cuda:${gpu}" --model 'dn-detr' \
+  --epochs 50 --lr_milestone 40 \
+  --return_intermediate --n_query 600 \
+  --pin_memory --save_root "model-store/${ex}" \
+  --cls_loss 'focal' --pos_embedding 'sinev2' --temperature 20 \
   --modulate_wh_attn --iter_update --transformer_activation 'prelu' \
-  --num_pattern 0 --num_group 3 --box_noise_scale 0.4 --label_noise_scale 0.2 \
-  --cls_match_weight 2.0 --l1_match_weight 5.0 --giou_match_weight 2.0 \
-  --cls_loss_weight 2.0 --l1_loss_weight 5.0 --giou_loss_weight 2.0 --noobj_cls_weight 0.1 \
-  --wb_flag --wb_project 'detr' --wb_name "${ex}" --wb_tags "DN-DETR"
+  --num_pattern 0 --num_group 5 --box_noise_scale 0.4 --label_noise_scale 0.2
 
-# DINO DETR
-ex=05
-python main.py --mode 'train' --device "cuda:0" --model 'dino-detr' --dataset 'shwd' \
-  --lr 0.0001 --lr_backbone 0.00001 --epochs 50 --lr_milestone 40 --lr_gamma 0.1 \
-  --return_intermediate --max_grad_norm 0.1 --weight_decay 0.0001 \
-  --d_model 256 --d_ff 2048 --n_heads 8 --p_drop 0.0 --n_query 600 \
-  --backbone "resnet50" --layer_index 7 --n_decoder_layers 6 --n_encoder_layers 6 \
-  --encoder_position_mode 'add' --decoder_sa_position_mode 'add' --decoder_ca_position_mode 'cat' \
-  --batch_size 8 --image_set 'trainval' --aug_policy 6 \
-  --num_workers 4 --pin_memory --save_root "model-store/ex${ex}" \
-  --cls_loss 'focal' --pos_embedding 'sinev2' --temperature 20 --query_scale_mode 'diag' \
+ex='DINO-DETR'
+python main.py --mode 'train' --device "cuda:${gpu}" --model 'dino-detr' \
+  --epochs 50 --lr_milestone 40 \
+  --return_intermediate --n_query 300 \
+  --pin_memory --save_root "model-store/${ex}" \
+  --cls_loss 'focal' --pos_embedding 'sinev2' --temperature 20 \
   --modulate_wh_attn --iter_update --transformer_activation 'prelu' \
   --num_dn_query 50 --add_neg_query --num_pattern 0 --num_group 5 \
   --box_noise_scale 0.4 --label_noise_scale 0.2 \
-  --cls_match_weight 2.0 --l1_match_weight 5.0 --giou_match_weight 2.0 \
-  --cls_loss_weight 2.0 --l1_loss_weight 5.0 --giou_loss_weight 2.0 --noobj_cls_weight 0.1 \
-  --wb_flag --wb_project 'detr' --wb_name "${ex}" --wb_tags "DINO-DETR"
+  --two_stage_mode 'mix' --num_encoder_query 300 --two_stage_share_head
 
 # Model evaluation.
-ex=01
-save_path="model-store/ex${ex}/test_result/"
+ex='DETR'
+save_path="model-store/${ex}/test_result/"
 
-python main.py --mode 'test' --device 'cuda:0' --pin_memory --batch_size 1  \
-    --eval_model_path "./model-store/ex${ex}/trained_model.pt" \
+python main.py --mode 'test' --device "cuda:${gpu}" --pin_memory --batch_size 1  \
+    --eval_model_path "./model-store/${ex}/trained_model.pt" \
     --save_root ${save_path}
 cd mAP/
 python main.py -na -np --dr "../${save_path}"
 cd ..
 ```
-</details>
 
 # To Do
 - [ ] Deformable Attention
-- [ ] (DINO) (Two-stage) mixed query selection.
 
 # Reference
 - https://github.com/facebookresearch/detr/
