@@ -20,7 +20,8 @@ class ATSS(torch.nn.Module):
             if gt_boxes.shape[0] == 0:
                 indices.append(temp_indices)
                 continue
-            distances = torch.cdist(gt_boxes, pred_box, p=2.0)
+            distances = torch.cdist(gt_boxes[: ,:2], pred_box[:, :2], p=2.0)
+            
             # select closest K anchors
             _, k_indices = torch.topk(distances, k=self.k, dim=1, largest=False)
 
@@ -45,7 +46,7 @@ class ATSS(torch.nn.Module):
                     cx, cy = k_boxes[k][:2]
 
                     # iou and spatial condition
-                    if iou > threshold and (x1 <= cx <= x2) and (y1 <= cy <= y2):
+                    if iou >= threshold and (x1 <= cx <= x2) and (y1 <= cy <= y2):
                         temp_indices[0].append(k_indices[i][k].item())
                         temp_indices[1].append(i)
             indices.append(temp_indices)
@@ -57,7 +58,8 @@ class ModifiedATSS(torch.nn.Module):
         super().__init__()
         self.k = k
         self.n = n
-        
+
+    @torch.no_grad()
     def forward(self, outputs, targets):
         indices = [] # matching indices
         pred_boxes = outputs['pred_boxes']
