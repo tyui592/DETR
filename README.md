@@ -33,9 +33,10 @@ NOTE: The average number of objects per image in this dataset is 16, which is hi
 - Co DETR
   - [ ] Auxiliary collaborative heads
       - [x] ATSS
-      - [ ] Faster-RCNN
+      - [ ] Faster-RCNN (loss calculation with ignore index)
       - [ ] PAA
   - [ ] Multi-scale adapter
+  - [ ] Customized positive query
 
 ### Experimental Results
 * Model performance (mAP)
@@ -45,8 +46,11 @@ NOTE: The average number of objects per image in this dataset is 16, which is hi
 - Check the [requirements.txt](./requirements.txt).
 
 ## Scripts
+Model training was conducted using a single A100 GPU (40GB). You can experiment with a GPU with less memory by reducing the batch size or image resolution.
+
 ```bash
-# DETR
+# Model Training Scripts
+
 gpu=0
 ex='DETR'
 python main.py --mode 'train' --device "cuda:${gpu}" --model 'detr' \
@@ -56,7 +60,6 @@ python main.py --mode 'train' --device "cuda:${gpu}" --model 'detr' \
   --pos_embedding 'sine' --temperature 10000 \
   --cls_match_weight 1.0 --cls_loss_weight 1.0
 
-# Conditional DETR
 ex='C_DETR'
 python main.py --mode 'train' --device "cuda:${gpu}" --model 'conditional_detr' \
   --epochs 50 --lr_milestone 40 --return_intermediate --n_query 600 \
@@ -64,7 +67,6 @@ python main.py --mode 'train' --device "cuda:${gpu}" --model 'conditional_detr' 
   --cls_loss 'focal' --pos_embedding 'sinev2' \
   --temperature 20 --query_scale_mode 'diag' 
 
-# DAB DETR
 ex='DAB-DETR'
 python main.py --mode 'train' --device "cuda:${gpu}" --model 'dab-detr' \
   --epochs 50 --lr_milestone 40 --return_intermediate \
@@ -73,7 +75,6 @@ python main.py --mode 'train' --device "cuda:${gpu}" --model 'dab-detr' \
   --cls_loss 'focal' --pos_embedding 'sinev2' --temperature 20 \
   --modulate_wh_attn --iter_update --transformer_activation 'prelu'
 
-# DN DETR
 ex='DN-DETR'
 python main.py --mode 'train' --device "cuda:${gpu}" --model 'dn-detr' \
   --epochs 50 --lr_milestone 40 \
@@ -94,7 +95,7 @@ python main.py --mode 'train' --device "cuda:${gpu}" --model 'dino-detr' \
   --box_noise_scale 0.4 --label_noise_scale 0.2 \
   --two_stage_mode 'mix' --num_encoder_query 300 --two_stage_share_head
 
-# Model evaluation.
+# Model Evaluation Scripts
 ex='DETR'
 save_path="model-store/${ex}/test_result/"
 
