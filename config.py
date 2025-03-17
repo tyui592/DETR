@@ -196,7 +196,16 @@ def build_parser():
     parser.add_argument('--num_encoder_query',
                         type=int,
                         default=100)
-
+    
+    # Co-DETR, Aux 
+    parser.add_argument('--aux_heads',
+                        type=str,
+                        nargs='+',
+                        default=['atss'])
+        
+    parser.add_argument('--atss_k',
+                        type=int,
+                        default=9)
 
     # Data
     parser.add_argument('--dataset',
@@ -276,17 +285,7 @@ def build_parser():
     parser.add_argument('--giou_match_weight',
                         type=float,
                         default=2.0)
-    
-    # ATSS
-    parser.add_argument('--atss_mode',
-                        type=str,
-                        choices=['none', 'atss', 'atss_mean', 'matss'],
-                        default='none')
-    
-    parser.add_argument('--atss_k',
-                        type=int,
-                        default=20)
-
+        
     # Loss
     parser.add_argument('--cls_loss',
                         type=str,
@@ -390,6 +389,9 @@ MODEL_SPEC = [
     
     # Two-stage (DINO-DETR, Co-DETR)
     'two_stage_mode', 'two_stage_share_head', 'num_encoder_query',
+    
+    # Co-DETR
+    'aux_heads',
 ]
 
 

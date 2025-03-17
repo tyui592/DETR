@@ -7,6 +7,7 @@ from collections import defaultdict
 from models.matcher import HungarianMatcher
 from utils.box_ops import generalized_box_iou, box_cxcywh_to_xyxy
 from utils.misc import AverageMeter
+from .auxiliary_head import get_aux_heads
 
 
 def get_co_detr_criterion(args, device):
@@ -18,6 +19,8 @@ def get_co_detr_criterion(args, device):
                                focal_gamma=args.focal_gamma,
                                focal_alpha=args.focal_alpha)
     
+    aux_heads = get_aux_heads(args)
+    
     criterion = Criterion(matcher=matcher,
                           n_cls=args.n_cls,
                           cls_loss=args.cls_loss,
@@ -27,7 +30,8 @@ def get_co_detr_criterion(args, device):
                           giou_weight=args.giou_loss_weight,
                           cls_weight=args.cls_loss_weight,
                           focal_gamma=args.focal_gamma,
-                          focal_alpha=args.focal_alpha).to(device)
+                          focal_alpha=args.focal_alpha,
+                          aux_heads=aux_heads).to(device)
 
     return criterion
 
@@ -45,7 +49,8 @@ class Criterion(nn.Module):
                  giou_weight: float = 1.0,
                  cls_weight: float = 1.0,
                  focal_gamma: float = 2.0,
-                 focal_alpha: float = 0.25):
+                 focal_alpha: float = 0.25,
+                 aux_heads: dict = {}):
         """Initialize."""
         super().__init__()
         self.matcher = matcher
@@ -55,6 +60,8 @@ class Criterion(nn.Module):
         self.loss_weights = {'l1': l1_weight,
                              'giou': giou_weight,
                              'cls': cls_weight}
+        
+        self.aux_heads = aux_heads
 
         if self.cls_loss == 'ce':
             # class weights
@@ -77,6 +84,7 @@ class Criterion(nn.Module):
     
     def set_summary(self):
         self.summary = defaultdict(AverageMeter)        
+        self.summary_debug = defaultdict(AverageMeter)
             
     @torch.no_grad()
     def calc_cardinality(self, outputs, targets):
@@ -124,13 +132,39 @@ class Criterion(nn.Module):
         target_cls_o = torch.cat([t['labels'][i] for t, (_, i) in zip(targets, indices)])
         target_cls[idx] = target_cls_o
         
-        loss = self.cls_criterion(outputs['pred_logits'].transpose(1, 2), target_cls, num_boxes)
+        loss = self.cls_criterion(outputs['pred_logits'], target_cls, num_boxes)
         
         if check_acc:
             top1_acc = self.calc_top1_accuracy(outputs['pred_logits'][idx], target_cls_o)
             self.summary['top1_acc'].update(top1_acc, n=len(target_cls_o))
             
         return loss
+    
+    def calc_cls_loss_with_ignore(self, outputs, targets, pos_indices, neg_indices):
+        def _get_src_permutation_idx(indices):
+            # permute predictions following indices
+            batch_idx = torch.cat([torch.full_like(src, i) for i, src in enumerate(indices)])
+            src_idx = torch.cat([src for src in indices])
+            return batch_idx, src_idx
+        pidx = self._get_src_permutation_idx(pos_indices)
+        nidx = _get_src_permutation_idx(neg_indices)
+        num_boxes = max(len(pidx[0]), 1)
+        
+        target_cls = torch.full(outputs['pred_logits'].shape[:2], -1,
+                                device=outputs['pred_logits'].device)
+        target_cls_p = torch.cat([t['labels'][i] for t, (_, i) in zip(targets, pos_indices)])
+        target_cls[pidx] = target_cls_p
+        
+        target_cls_n = torch.cat([torch.full(i.shape, self.n_cls) for i in neg_indices]).to(target_cls.device)
+        target_cls[nidx] = target_cls_n
+        
+        foreground_idx = target_cls != -1
+        
+        src = outputs['pred_logits'][foreground_idx]
+        tgt = target_cls[foreground_idx]
+        onehot = F.one_hot(tgt, self.n_cls + 1)[..., :-1].to(src.device).float()
+        cls_loss = sigmoid_focal_loss(src[None, ...], onehot[None, ...]) / num_boxes * src.shape[0]
+        return cls_loss
     
     def calc_total_loss(self, losses):
         """Calcualte the total loss"""
@@ -144,6 +178,8 @@ class Criterion(nn.Module):
                 total_losses['giou'] += values
             elif 'cls' in key:
                 total_losses['cls'] += values
+            self.summary_debug[key].update(sum(values).item()/len(values),
+                                           n=len(values))
         
         # Weighted sum
         total_loss = 0
@@ -185,14 +221,21 @@ class Criterion(nn.Module):
                     self.summary['cardinality'].update(cardinality)
 
         # use auxiliary collaborative heads
-        for key in ['aux']:
-            _outputs = outputs[key]
-            if not self.aux_flag:
-                _outputs = _outputs[-1:]
-            for output in _outputs:
-                for aux_key, indices in outputs['aux_indices'].items():
-                    l1_loss, giou_loss = self.calc_box_loss(output, targets, indices)
-                    cls_loss = self.calc_cls_loss(output, targets, indices)
+        if 'aux' in outputs:
+            aux_outputs = outputs['aux']
+            for aux_key, aux_matcher in self.aux_heads.items():
+                _outputs = aux_outputs[aux_key]
+                if not self.aux_flag:
+                    _outputs = _outputs[-1:]
+                for output in _outputs:
+                    if aux_key == 'atss':
+                        indices = aux_matcher(output, targets)
+                        l1_loss, giou_loss = self.calc_box_loss(output, targets, indices)
+                        cls_loss = self.calc_cls_loss(output, targets, indices)
+                    elif aux_key == 'faster_rcnn':
+                        pos_indices, neg_indices = aux_matcher(output, targets)
+                        l1_loss, giou_loss = self.calc_box_loss(output, targets, pos_indices)
+                        cls_loss = self.calc_cls_loss_with_ignore(output, targets, pos_indices, neg_indices)
 
                     losses[f'{aux_key}_l1_loss'].append(l1_loss)
                     losses[f'{aux_key}_giou_loss'].append(giou_loss)
@@ -214,7 +257,7 @@ class CrossEntropy(nn.Module):
 
     def forward(self, inputs, targets, num_boxes):
         """Forward function."""
-        return self.criterion(inputs, targets)
+        return self.criterion(inputs.transpose(1, 2), targets)
 
 
 class FocalLoss(nn.Module):
@@ -229,8 +272,7 @@ class FocalLoss(nn.Module):
 
     def forward(self, inputs, targets, num_boxes):
         """Forward function."""
-        inputs = inputs.transpose(1, 2)
-        onehot = F.one_hot(targets, self.n_cls + 1)[:, :, :-1].to(inputs.device).float()
+        onehot = F.one_hot(targets, self.n_cls + 1)[..., :-1].to(inputs.device).float()
         loss = sigmoid_focal_loss(inputs, onehot, self.alpha, self.gamma)
         return loss / num_boxes * inputs.shape[1]
 

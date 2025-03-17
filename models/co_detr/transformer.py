@@ -8,7 +8,7 @@ from typing import Optional
 from collections import defaultdict
 from utils.misc import inverse_sigmoid
 from .layers import MHA, FeedForward, MLP
-from .atss import get_atss
+
 
 def get_transformer(args):
     """Get a transformer model with the arguments."""
@@ -28,9 +28,7 @@ def get_transformer(args):
                               modulate_wh_attn=args.modulate_wh_attn,
                               decoder_temperature=args.temperature,
                               two_stage_mode=args.two_stage_mode,
-                              num_encoder_query=args.num_encoder_query,
-                              atss_mode=args.atss_mode,
-                              atss_k=args.atss_k)
+                              num_encoder_query=args.num_encoder_query)
     return transformer
 
 
@@ -55,8 +53,7 @@ class Transformer(nn.Module):
                  decoder_temperature: int = 10000,
                  two_stage_mode: str = 'static',
                  num_encoder_query: int = 100,
-                 atss_mode: str = 'atss_mean',
-                 atss_k: int = 9,
+                #  aux_heads: dict = {}
                  ):
         """Initiailze."""
         super().__init__()
@@ -82,7 +79,7 @@ class Transformer(nn.Module):
                                temperature=decoder_temperature,
                                modulate_wh_attn=modulate_wh_attn)
         
-        self.atss = get_atss(atss_mode, atss_k)
+        # self.aux_heads = aux_heads
 
         self.two_stage_mode = two_stage_mode
         if self.two_stage_mode in ['pure', 'mix']:
@@ -129,7 +126,7 @@ class Transformer(nn.Module):
         memory = self.encoder(img_feature, img_pos_embed, img_mask)
 
         # two stage
-        enc_output = None
+        enc_topk_output = None
         reference = None
         if self.two_stage_mode in ['pure', 'mix'] or hasattr(self, 'atss'):
             memory = self.enc_out_norm(self.enc_out_layer(memory))
@@ -144,10 +141,10 @@ class Transformer(nn.Module):
             # get topk(by logit) samples(boxs, labels) from the encoder output
             enc_topk_output = self.get_topk_query(boxes, logits, img_mask, self.num_encoder_query)
 
-            aux_query = None
-            aux_indices = None
-            if hasattr(self, 'atss') and self.training:
-                aux_query, aux_indices = self.make_aux_query(boxes, logits, targets, label_enc, memory.device)
+            # aux_query = None
+            # aux_indices = None
+            # if hasattr(self, 'atss') and self.training:
+            #     aux_query, aux_indices = self.make_aux_query(boxes, logits, targets, label_enc, memory.device)
                 
         # make query for decoder (merge multiple queries for efficiency)
         label_query, anchor_query, dec_sa_mask = self.make_object_query(bs=memory.shape[0],
@@ -156,7 +153,7 @@ class Transformer(nn.Module):
                                                                         label_enc=label_enc,
                                                                         anchor_query=anchor_query,
                                                                         noised_query=noised_query,
-                                                                        aux_query=aux_query,
+                                                                        aux_query=None,
                                                                         device=memory.device)
                 
         # decoder
@@ -167,22 +164,22 @@ class Transformer(nn.Module):
                                    mask=img_mask,
                                    attn_mask=dec_sa_mask)
                 
-        return hs, anchors, reference, memory, aux_indices
+        return hs, anchors, reference, memory
     
-    def make_aux_query(self, boxes, logits, targets, label_enc, device):
-        # make index for loss calculation
-        atss_indices = self.atss({'pred_boxes': boxes, 'pred_logits': logits}, targets)
+    # def make_aux_query(self, boxes, logits, targets, label_enc, device):
+    #     # make index for loss calculation
+    #     atss_indices = self.atss({'pred_boxes': boxes, 'pred_logits': logits}, targets)
 
-        labels = logits.argmax(dim=-1)
-        bs, nq = labels.shape
-        label_embeddings = label_enc(labels)
-        indicator1 = torch.ones([1, 1, 1], dtype=label_embeddings.dtype, device=device)
-        label_query = torch.cat([label_embeddings, indicator1.repeat(bs, nq, 1)], dim=-1)
-        anchor_query = inverse_sigmoid(boxes)
+    #     labels = logits.argmax(dim=-1)
+    #     bs, nq = labels.shape
+    #     label_embeddings = label_enc(labels)
+    #     indicator1 = torch.ones([1, 1, 1], dtype=label_embeddings.dtype, device=device)
+    #     label_query = torch.cat([label_embeddings, indicator1.repeat(bs, nq, 1)], dim=-1)
+    #     anchor_query = inverse_sigmoid(boxes)
 
-        aux_query = {'label_query': label_query, 'anchor_query': anchor_query}
-        aux_indices = {'atss': atss_indices}
-        return aux_query, aux_indices
+    #     aux_query = {'label_query': label_query, 'anchor_query': anchor_query}
+    #     aux_indices = {'atss': atss_indices}
+    #     return aux_query, aux_indices
     
     def get_encoder_reference(self, mask, shapes):
         N, _, H, W = shapes
@@ -202,10 +199,7 @@ class Transformer(nn.Module):
 
         xy = (xy.unsqueeze(0) + 0.5) / scale
 
-        # TODO: need to improve current hard coding
         wh = torch.ones_like(xy) * 0.1
-        # wh = torch.rand_like(xy) * 0.5
-        # wh = torch.randint_like(xy, 1, 5) * 0.1
 
         enc_ref = inverse_sigmoid(torch.cat([xy, wh], dim=-1))
         enc_ref = enc_ref.masked_fill(mask.unsqueeze(-1) == 0, float('-inf'))

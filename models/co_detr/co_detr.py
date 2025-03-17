@@ -5,7 +5,7 @@ import math
 import copy
 import torch.nn as nn
 import torch.nn.functional as F
-
+from collections import defaultdict
 from utils.misc import inverse_sigmoid
 
 from .backbone import get_backbone
@@ -40,7 +40,8 @@ def get_co_detr(args, device):
                     add_neg_query=args.add_neg_query,
                     fix_init_xy=args.fix_init_xy,
                     two_stage_mode=args.two_stage_mode,
-                    two_stage_share_head=args.two_stage_share_head).to(device)
+                    two_stage_share_head=args.two_stage_share_head,
+                    aux_heads=args.aux_heads).to(device)
 
     return model
 
@@ -64,7 +65,8 @@ class Co_DETR(nn.Module):
                  add_neg_query: bool = True,
                  fix_init_xy: bool = False,
                  two_stage_mode: str = 'none',
-                 two_stage_share_head: bool = True):
+                 two_stage_share_head: bool = True,
+                 aux_heads: list = []):
         """Initialize.
         """
         super().__init__()
@@ -121,6 +123,11 @@ class Co_DETR(nn.Module):
             self.transformer.enc_box_embed = copy.deepcopy(_box_embed)
             self.transformer.enc_cls_embed = copy.deepcopy(_cls_embed)
 
+        # collaborative aux heads
+        self.aux_heads = aux_heads
+        self.aux_cls_embed_lst = nn.ModuleList([copy.deepcopy(_cls_embed) for _ in self.aux_heads])
+        self.aux_box_embed_lst = nn.ModuleList([copy.deepcopy(_box_embed) for _ in self.aux_heads])
+        
         # init 
         nn.init.normal_(self.label_enc.weight.data, mean=0.0, std=0.02)
 
@@ -159,7 +166,7 @@ class Co_DETR(nn.Module):
                                           add_neg_query=self.add_neg_query,
                                           device=img.device)
         
-        hs, anchors, enc_ref, memory, aux_indices = self.transformer(img_feature=image_feature,
+        hs, anchors, enc_ref, memory = self.transformer(img_feature=image_feature,
                                                         img_pos_embed=pos_embed,
                                                         img_mask=mask,
                                                         anchor_query=self.anchor_query,
@@ -183,6 +190,16 @@ class Co_DETR(nn.Module):
                 'pred_logits': self.transformer.enc_cls_embed(memory),
                 'pred_boxes': (enc_ref + self.transformer.enc_box_embed(memory)).sigmoid()
                 })
+            
+            if self.aux_heads != []:
+                aux_outputs = defaultdict(list)
+                for aux_key, cls_embed, box_embed in zip(self.aux_heads,
+                                                         self.aux_cls_embed_lst,
+                                                         self.aux_box_embed_lst):
+                    aux_outputs[aux_key].append({
+                        'pred_logits': cls_embed(memory),
+                        'pred_boxes': (enc_ref + box_embed(memory)).sigmoid()
+                    })
 
             # Split matching part and denosing part
             num_noised_query = self.num_dn_query * self.num_group * (2 if self.add_neg_query else 1)
@@ -190,16 +207,16 @@ class Co_DETR(nn.Module):
                 num_model_query = self.anchor_query.weight.shape[0]
             else:
                 num_model_query = min(self.transformer.num_encoder_query, memory.shape[1])
-            num_aux_query = memory.shape[1]
-            split_sizes = [num_noised_query, num_model_query, num_aux_query]
-            split_labels = ['cdn', 'model', 'aux']
+            split_sizes = [num_noised_query, num_model_query]
+            split_labels = ['cdn', 'model']
             outputs = split_outputs(outputs, split_sizes, split_labels) # split matching part and denoising part
             
             # add taragets for training
             outputs['cdn_targets'] = noised_query['targets']
             outputs['cdn_indices'] = noised_query['indices']
             outputs['first_stage'] = first_stage
-            outputs['aux_indices'] = aux_indices
+            if self.aux_heads != []:
+                outputs['aux'] = aux_outputs
             
         else:
             outputs = {

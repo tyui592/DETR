@@ -28,13 +28,12 @@ NOTE: The average number of objects per image in this dataset is 16, which is hi
 - DNIO DETR
   - [X] A fixed number of noised queries
   - [X] Noised negative queries
-  - [x] Mixed query selection
+  - [X] Mixed query selection
   - [ ] Look forward twice  
 - Co DETR
-  - [ ] Auxiliary collaborative heads
-      - [x] ATSS
-      - [ ] Faster-RCNN (loss calculation with ignore index)
-      - [ ] PAA
+  - [X] Auxiliary collaborative heads
+      - [X] ATSS
+      - [X] Faster-RCNN (loss calculation with ignore index)
   - [ ] Multi-scale adapter
   - [ ] Customized positive query
 
@@ -109,6 +108,7 @@ cd ..
 
 # To Do
 - [ ] Deformable Attention
+- [ ] Multi-scale Features
 
 # Reference
 - https://github.com/facebookresearch/detr/
