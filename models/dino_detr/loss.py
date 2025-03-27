@@ -77,6 +77,7 @@ class Criterion(nn.Module):
     
     def set_summary(self):
         self.summary = defaultdict(AverageMeter)        
+        self.summary_debug = defaultdict(AverageMeter)
             
     @torch.no_grad()
     def calc_cardinality(self, outputs, targets):
@@ -144,7 +145,8 @@ class Criterion(nn.Module):
                 total_losses['giou'] += values
             elif 'cls' in key:
                 total_losses['cls'] += values
-        
+            self.summary_debug[key].update(sum(values).item()/len(values), n=len(values))
+
         # Weighted sum
         total_loss = 0
         for key, weight in self.loss_weights.items():

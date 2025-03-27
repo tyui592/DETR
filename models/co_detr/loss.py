@@ -178,8 +178,7 @@ class Criterion(nn.Module):
                 total_losses['giou'] += values
             elif 'cls' in key:
                 total_losses['cls'] += values
-            self.summary_debug[key].update(sum(values).item()/len(values),
-                                           n=len(values))
+            self.summary_debug[key].update(sum(values).item()/len(values), n=len(values))
         
         # Weighted sum
         total_loss = 0

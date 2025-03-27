@@ -228,7 +228,6 @@ class Transformer(nn.Module):
                           encoder_output: Optional[dict],
                           label_enc: torch.nn.Embedding,
                           anchor_query: Optional[torch.nn.Embedding],
-                          aux_query: Optional[dict],
                           noised_query: dict,
                           device: torch.device):
         """Make decoder input query and attn. mask
@@ -300,14 +299,6 @@ class Transformer(nn.Module):
                 _anchor_query.append(enc_anchor_query)
                 _attn_mask.append(torch.ones((k, k), device=device))
             
-            if aux_query is not None:
-                aux_label_query = aux_query['label_query']
-                aux_anchor_query = aux_query['anchor_query']
-                k = aux_label_query.shape[1]
-                _label_query.append(aux_label_query)
-                _anchor_query.append(aux_anchor_query)
-                _attn_mask.append(torch.ones((k, k), device=device))
-
             label_query = torch.cat(_label_query, dim=1)
             anchor_query = torch.cat(_anchor_query, dim=1)
             attn_mask = torch.block_diag(*_attn_mask)

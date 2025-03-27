@@ -89,6 +89,12 @@ def train_step(model, dataloader, criterion, postprocessor, optimizer, logger, d
                            summary=criterion.summary,
                            logger=logger,
                            args=args)
+            logging_losses_debug(index=index,
+                                 n_step=len(dataloader),
+                                 epoch=epoch,
+                                 summary=criterion.summary_debug,
+                                 logger=logger,
+                                 args=args)
         tictoc = time.time()
 
     # save predictions
@@ -144,6 +150,19 @@ def logging_losses(index, step, n_step, epoch, summary, logger, args):
         ))
     if args.wb_flag:
         wandb.log(wb_loss_log, step=step)
+    return None
+
+def logging_losses_debug(index, n_step, epoch, summary, logger, args):
+    loss_logs = []
+    for key, value in summary.items():
+        loss_logs.append(f"{key}: {value.avg:1.4f}")
+    loss_summary = ', '.join(loss_logs)
+
+    logger.debug((
+        f"Epoch: {epoch}/{args.epochs}, "
+        f"Iter: {index}/{n_step}, "
+        f"Loss: [{loss_summary}]"
+        ))
     return None
 
 
