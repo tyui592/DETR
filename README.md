@@ -109,6 +109,7 @@ cd ..
 # To Do
 - [ ] Deformable Attention
 - [ ] Multi-scale Features
+- [ ] RT-DETR
 
 # Reference
 - https://github.com/facebookresearch/detr/
